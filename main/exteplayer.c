@@ -234,6 +234,11 @@ static char *map_inter_file_path(const char *filename)
 {
     char *filename2 = NULL;
 
+    if(!filename)
+    {
+        return NULL;
+    }
+
     if( strncmp(filename, "iptv://", 7) == 0 )
     {
         FILE *f = fopen(filename + 7, "r");
@@ -244,7 +249,7 @@ static char *map_inter_file_path(const char *filename)
             rewind(f);
 
             filename2 = malloc(file_size+2);
-            size_t num = fread(filename2, 1, file_size, f);
+            size_t num = fread(filename2, 1, file_size, f); // NOSONAR
             fclose(f);
 
             if (num > 0 && filename2[num-1] == '\n')
@@ -255,18 +260,21 @@ static char *map_inter_file_path(const char *filename)
             {
                 filename2[num] = '\0';
             }
-            filename = filename2;
         }
         else
         {
             return NULL;
         }
     }
+    else
+    {
+        filename2 = strdup(filename);
+    }
 
-    size_t filename_len = strlen(filename);
+    size_t filename_len = strlen(filename2);
     const char *filname_prefix = "";
 
-    if( strstr(filename, "://") == NULL )
+    if( strstr(filename2, "://") == NULL )
     {
         filname_prefix = "file://";
         filename_len += strlen(filname_prefix);
@@ -274,12 +282,7 @@ static char *map_inter_file_path(const char *filename)
 
     char *ret = malloc(filename_len+2);
     strcpy(ret, filname_prefix);
-    strcat(ret, filename);
-
-    if( filename2 )
-    {
-        free(filename2);
-    }
+    strcat(ret, filename2);
 
     char *param = getParamMPD(ret);
     if (param)
@@ -327,6 +330,11 @@ static char *map_inter_file_path(const char *filename)
             idx++;
         }
         ret[pos] = '\0';
+    }
+
+    if( filename2 )
+    {
+        free(filename2);
     }
 
     return ret;
