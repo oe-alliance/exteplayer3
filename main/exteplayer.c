@@ -46,7 +46,6 @@
 #include "debug.h"
 
 #define DUMP_BOOL(x) 0 == x ? "false"  : "true"
-#define IPTV_MAX_FILE_PATH 1024
 
 extern int ffmpeg_av_dict_set(const char *key, const char *value, int flags);
 extern void       aac_software_decoder_set(const int32_t val);
@@ -231,30 +230,61 @@ char* getParamMPD(char* name)
     }
 }
 
-static void map_inter_file_path(char *filename)
+static char *map_inter_file_path(const char *filename)
 {
-    if (0 == strncmp(filename, "iptv://", 7))
+    char *filename2 = NULL;
+
+    if( strncmp(filename, "iptv://", 7) == 0 )
     {
         FILE *f = fopen(filename + 7, "r");
-        if (NULL != f)
+        if( f != NULL )
         {
-            size_t num = fread(filename, 1, IPTV_MAX_FILE_PATH-1, f);
+            fseek(f, 0L, SEEK_END);
+            size_t file_size = ftell(f);
+            rewind(f);
+
+            filename2 = malloc(file_size+2);
+            size_t num = fread(filename2, 1, file_size, f);
             fclose(f);
-            if (num > 0 && filename[num-1] == '\n')
+
+            if (num > 0 && filename2[num-1] == '\n')
             {
-                filename[num-1] = '\0';
+                filename2[num-1] = '\0';
             }
             else
             {
-                filename[num] = '\0';
+                filename2[num] = '\0';
             }
+            filename = filename2;
+        }
+        else
+        {
+            return NULL;
         }
     }
 
-    char *param = getParamMPD(filename);
+    size_t filename_len = strlen(filename);
+    const char *filname_prefix = "";
+
+    if( strstr(filename, "://") == NULL )
+    {
+        filname_prefix = "file://";
+        filename_len += strlen(filname_prefix);
+    }
+
+    char *ret = malloc(filename_len+2);
+    strcpy(ret, filname_prefix);
+    strcat(ret, filename);
+
+    if( filename2 )
+    {
+        free(filename2);
+    }
+
+    char *param = getParamMPD(ret);
     if (param)
     {
-        int pos = param - filename;
+        int pos = param - ret;
         param+=1;
         int len = strlen(param)+1;
         int idx = 0;
@@ -264,10 +294,10 @@ static void map_inter_file_path(char *filename)
         {
             if(param[idx] == '=')
                 start = idx-1;
-        
+
             if((param[idx] == '\0') || (param[idx] == '\n') || (param[idx] == '&'))
                 end = idx;
- 
+
             if(start != -1 && end != -1)
             {
                 char str[1000];
@@ -296,8 +326,10 @@ static void map_inter_file_path(char *filename)
             }
             idx++;
         }
-        filename[pos+4] = '\0';
+        ret[pos] = '\0';
     }
+
+    return ret;
 }
 
 /**
@@ -645,11 +677,7 @@ static int ParseParams(int argc,char* argv[], PlayFiles_t *playbackFiles, int *p
         case 'x':
             if (optarg[0] != '\0')
             {
-                playbackFiles->szSecondFile = malloc(IPTV_MAX_FILE_PATH);
-                playbackFiles->szSecondFile[0] = '\0';
-                strncpy(playbackFiles->szSecondFile, optarg, IPTV_MAX_FILE_PATH-1);
-                playbackFiles->szSecondFile[IPTV_MAX_FILE_PATH] = '\0';
-                map_inter_file_path(playbackFiles->szSecondFile);
+                playbackFiles->szSecondFile = map_inter_file_path(optarg);
             }
             break;
         case 'h':
@@ -728,11 +756,7 @@ static int ParseParams(int argc,char* argv[], PlayFiles_t *playbackFiles, int *p
         case 'F':
             if (optarg[0] != '\0')
             {
-                playbackFiles->szFirstMoovAtomFile = malloc(IPTV_MAX_FILE_PATH);
-                playbackFiles->szFirstMoovAtomFile[0] = '\0';
-                strncpy(playbackFiles->szFirstMoovAtomFile, optarg, IPTV_MAX_FILE_PATH-1);
-                playbackFiles->szFirstMoovAtomFile[IPTV_MAX_FILE_PATH] = '\0';
-                map_inter_file_path(playbackFiles->szFirstMoovAtomFile);
+                playbackFiles->szFirstMoovAtomFile = map_inter_file_path(optarg);
             }
             break;
 
@@ -753,16 +777,7 @@ static int ParseParams(int argc,char* argv[], PlayFiles_t *playbackFiles, int *p
 
     if (0 == ret && optind < argc)
     {
-        ret = 0;
-        playbackFiles->szFirstFile = malloc(IPTV_MAX_FILE_PATH);
-        playbackFiles->szFirstFile[0] = '\0';
-        if(NULL == strstr(argv[optind], "://"))
-        {
-            strcpy(playbackFiles->szFirstFile, "file://");
-        }
-        strcat(playbackFiles->szFirstFile, argv[optind]);
-        playbackFiles->szFirstFile[IPTV_MAX_FILE_PATH] = '\0';
-        map_inter_file_path(playbackFiles->szFirstFile);
+        playbackFiles->szFirstFile = map_inter_file_path(argv[optind]);
         printf("file: [%s]\n", playbackFiles->szFirstFile);
         ++optind;
     }
@@ -812,7 +827,7 @@ int main(int argc, char* argv[])
     int commandRetVal = -1;
 
     /* inform client that we can handle additional commands */
-    E2iSendMsg("{\"EPLAYER3_EXTENDED\":{\"version\":%d}}\n", 178);
+    E2iSendMsg("{\"EPLAYER3_EXTENDED\":{\"version\":%d}}\n", 179);
 
     PlayFiles_t playbackFiles;
     memset(&playbackFiles, 0x00, sizeof(playbackFiles));
