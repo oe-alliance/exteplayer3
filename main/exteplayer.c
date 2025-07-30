@@ -269,11 +269,11 @@ static char *map_inter_file_path(const char *filename)
     }
 
     const char *filename_prefix = "";
-    size_t filename_len = strlen(filename) + 1;
+    size_t filename_len = strlen(filename) + 1; // NOSONAR
 
     if (!strstr(filename, "://")) {
         filename_prefix = "file://";
-        filename_len += strlen(filename_prefix);
+        filename_len += strlen(filename_prefix); // NOSONAR
     }
 
     char *ret = malloc(filename_len);
