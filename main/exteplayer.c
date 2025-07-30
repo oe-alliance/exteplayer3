@@ -260,29 +260,26 @@ static char *map_inter_file_path(const char *filename)
             {
                 filename2[num] = '\0';
             }
+            filename = filename2;
         }
         else
         {
             return NULL;
         }
     }
-    else
-    {
-        filename2 = strdup(filename);
+
+    const char *filename_prefix = "";
+    size_t filename_len = strlen(filename) + 1;
+
+    if (!strstr(filename, "://")) {
+        filename_prefix = "file://";
+        filename_len += strlen(filename_prefix);
     }
 
-    size_t filename_len = strlen(filename2);
-    const char *filname_prefix = "";
+    char *ret = malloc(filename_len);
+    if (!ret) return NULL;
 
-    if( strstr(filename2, "://") == NULL )
-    {
-        filname_prefix = "file://";
-        filename_len += strlen(filname_prefix);
-    }
-
-    char *ret = malloc(filename_len+2);
-    strcpy(ret, filname_prefix);
-    strcat(ret, filename2);
+    snprintf(ret, filename_len, "%s%s", filename_prefix, filename);
 
     char *param = getParamMPD(ret);
     if (param)
