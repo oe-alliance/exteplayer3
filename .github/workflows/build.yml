@@ -13,7 +13,7 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Install dependencies
       run: |
@@ -21,14 +21,30 @@ jobs:
         sudo apt-get install -y \
           build-essential \
           pkg-config \
-          libswscale-dev \
+          autoconf \
+          automake \
+          libtool \
           libavformat-dev \
           libavcodec-dev \
           libavutil-dev \
           libswresample-dev \
+          libswscale-dev \
+          libxml2-dev \
+          libssl-dev \
+          libbluray-dev \
+          librtmp-dev \
+          libudfread-dev \
           libasound2-dev \
+          zlib1g-dev \
+          libbz2-dev \
+          liblzma-dev \
           libpthread-stubs0-dev
 
+    - name: Bootstrap autotools
+      run: ./autogen.sh
+
+    - name: Configure
+      run: ./configure
+
     - name: Compile exteplayer3
-      run: |
-        make -j$(nproc)
+      run: make -j$(nproc)

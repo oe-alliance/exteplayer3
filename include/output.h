@@ -83,6 +83,10 @@ typedef struct Output_s
 
 extern Output_t LinuxDvbOutput;
 extern Output_t SubtitleOutput;
+#ifdef HAVE_DREAMNEXTGEN
+extern Output_t DreamAudioOutput;
+extern Output_t DreamVideoOutput;
+#endif
 
 typedef struct OutputHandler_s
 {

@@ -22,6 +22,10 @@
 /* Includes                      */
 /* ***************************** */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include "debug.h"
@@ -47,6 +51,10 @@ static const char* FILENAME = "output.c";
 /* ***************************** */
 
 static Output_t * AvailableOutput[] = {
+#ifdef HAVE_DREAMNEXTGEN
+    &DreamAudioOutput,
+    &DreamVideoOutput,
+#endif
     &LinuxDvbOutput,
     &SubtitleOutput,
     NULL
