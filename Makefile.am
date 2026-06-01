@@ -11,7 +11,8 @@ AM_CPPFLAGS = \
     $(SSL_CFLAGS) \
     $(BLURAY_CFLAGS) \
     $(RTMP_CFLAGS) \
-    $(UDFREAD_CFLAGS)
+    $(UDFREAD_CFLAGS) \
+    $(ALSA_CFLAGS)
 
 AM_CFLAGS = -Wall -Wno-unused-parameter -Wno-unused-but-set-variable
 
@@ -62,6 +63,10 @@ exteplayer3_SOURCES = \
     external/flv2mpeg4/src/flv2mpeg4.c \
     external/plugins/src/png.c
 
+if HAVE_DREAMNEXTGEN
+exteplayer3_SOURCES += output/dream_audio.c output/dream_video.c
+endif
+
 exteplayer3_LDADD = \
     $(FFMPEG_LIBS) \
     $(XML2_LIBS) \
@@ -69,6 +74,7 @@ exteplayer3_LDADD = \
     $(BLURAY_LIBS) \
     $(RTMP_LIBS) \
     $(UDFREAD_LIBS) \
+    $(ALSA_LIBS) \
     $(ZLIB_LIBS) \
     $(BZ2_LIBS) \
     $(LZMA_LIBS) \

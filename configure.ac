@@ -44,6 +44,22 @@ AC_SUBST([LIBM_LIBS])
 AC_SUBST([DL_LIBS])
 
 # ---------------------------------------------------------------------------
+# Optional: DreamNextGen build (AMlogic dreamone/dreamtwo)
+#   - ALSA audio output module (output/dream_audio.c)
+#   - amstream_vbuf video output module (output/dream_video.c)
+# ---------------------------------------------------------------------------
+AC_ARG_ENABLE([dreamnextgen],
+    [AS_HELP_STRING([--enable-dreamnextgen],
+        [Build DreamNextGen (AMlogic dreamone/dreamtwo) backend @<:@default=no@:>@])],
+    [enable_dreamnextgen=$enableval], [enable_dreamnextgen=no])
+
+if test "x$enable_dreamnextgen" = "xyes"; then
+    PKG_CHECK_MODULES([ALSA], [alsa])
+    AC_DEFINE([HAVE_DREAMNEXTGEN], [1], [Build dreamone/dreamtwo backend])
+fi
+AM_CONDITIONAL([HAVE_DREAMNEXTGEN], [test "x$enable_dreamnextgen" = "xyes"])
+
+# ---------------------------------------------------------------------------
 # Optional: flv2mpeg4 converter (on by default — matches legacy build)
 # ---------------------------------------------------------------------------
 AC_ARG_ENABLE([flv2mpeg4],
@@ -68,5 +84,6 @@ AC_OUTPUT
 
 AC_MSG_NOTICE([])
 AC_MSG_NOTICE([  exteplayer3 ${PACKAGE_VERSION}])
+AC_MSG_NOTICE([    dreamnextgen      : ${enable_dreamnextgen}])
 AC_MSG_NOTICE([    flv2mpeg4         : ${enable_flv2mpeg4}])
 AC_MSG_NOTICE([])

@@ -16,6 +16,10 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  *
  */
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -884,6 +888,27 @@ int main(int argc, char* argv[])
         printf("[-H osd window height (height of the window used to scale graphic subtitle frame)\n");
         exit(1);
     }
+
+#ifdef HAVE_DREAMNEXTGEN
+    /* DreamNextGen (AMlogic dreamone/dreamtwo) has no kernel ES audio
+     * decoder — force every codec through libavcodec → libswresample so
+     * container_ffmpeg.c always emits A_IPCM (S16 PCM) into our ALSA
+     * sink in output/dream_audio.c.
+     *
+     * Must run AFTER ParseParams: serviceapp invokes us with `-a 0 -n 0`
+     * etc. which would otherwise clear the flags right after we set them. */
+    printf("DreamAudio: forcing software decode for AAC/AC3/EAC3/DTS/MP3/WMA/Vorbis/Opus/AMR\n");
+    aac_software_decoder_set(1);
+    aac_latm_software_decoder_set(1);
+    ac3_software_decoder_set(1);
+    eac3_software_decoder_set(1);
+    dts_software_decoder_set(1);
+    mp3_software_decoder_set(1);
+    wma_software_decoder_set(1);
+    vorbis_software_decoder_set(1);
+    opus_software_decoder_set(1);
+    amr_software_decoder_set(1);
+#endif
 
     ffmpeg_av_dict_set("fake_last_subtitle", "1", 0);
 
