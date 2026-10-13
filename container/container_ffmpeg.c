@@ -768,8 +768,7 @@ static void FFMPEGThread(Context_t *context)
                  * HLS stitched sources (PlutoTV) it fired on every stitcher
                  * segment boundary and starved the audio producer: vpts
                  * stuck for minutes with av_drift = -425000 ms. Leaving
-                 * disabled. dream_audio's da_reset_anchor_locked() stays
-                 * available for when a real seek-completed wiring exists. */
+                 * disabled. */
             }
             else
             {

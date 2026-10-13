@@ -52,7 +52,6 @@ static const char* FILENAME = "output.c";
 
 static Output_t * AvailableOutput[] = {
 #ifdef HAVE_DREAMNEXTGEN
-    &DreamAudioOutput,
     &DreamVideoOutput,
 #endif
     &LinuxDvbOutput,

@@ -60,7 +60,12 @@
 #define cERR_LINUXDVB_ERROR        -1
 
 static const char VIDEODEV[] = "/dev/dvb/adapter0/video0";
+#ifdef HAVE_DREAMNEXTGEN
+/* the audio decoder of the dreamaudiod service */
+static const char AUDIODEV[] = "/dev/dvb/adapter0/dreamaudio0";
+#else
 static const char AUDIODEV[] = "/dev/dvb/adapter0/audio0";
+#endif
 
 static int videofd 	= -1;
 static int audiofd 	= -1;

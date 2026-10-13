@@ -916,56 +916,14 @@ int main(int argc, char* argv[])
     }
 
 #ifdef HAVE_DREAMNEXTGEN
-    /* No kernel ES audio decoder: force SW decode for every codec except
-     * those the user opted into passthrough for. Must run after ParseParams
-     * (serviceapp's -a/-n args would otherwise clear the flags again). */
-    {
-        int pt_ac3 = 0, pt_eac3 = 0, pt_dts = 0, pt_truehd = 0;
-        FILE *f = fopen("/sys/class/audiodsp/digital_raw", "r");
-        int digital_raw = 0;
-        if (f) { if (fscanf(f, "%d", &digital_raw) != 1) digital_raw = 0; fclose(f); }
-        if (digital_raw > 0) {
-            FILE *s = fopen("/etc/enigma2/settings", "r");
-            char eac3_val[64]  = "passthrough";  /* default-on for EAC3 */
-            char dts_val[64]   = "";             /* default-off for DTS */
-            char truehd_val[64] = "";            /* default-off for TrueHD */
-            if (s) {
-                char line[256];
-                while (fgets(line, sizeof(line), s)) {
-                    if (strncmp(line, "config.av.transcodeac3plus=", 27) == 0) {
-                        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
-                        snprintf(eac3_val, sizeof(eac3_val), "%s", line + 27);
-                    } else if (strncmp(line, "config.av.dtshd=", 16) == 0) {
-                        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
-                        snprintf(dts_val, sizeof(dts_val), "%s", line + 16);
-                    } else if (strncmp(line, "config.av.truehd=", 17) == 0) {
-                        char *nl = strchr(line, '\n'); if (nl) *nl = 0;
-                        snprintf(truehd_val, sizeof(truehd_val), "%s", line + 17);
-                    }
-                }
-                fclose(s);
-            }
-            pt_ac3 = 1;
-            pt_eac3 = (strcmp(eac3_val, "passthrough") == 0
-                    || strcmp(eac3_val, "use_hdmi_caps") == 0);
-            pt_dts  = (dts_val[0] && strcmp(dts_val, "downmix") != 0);
-            pt_truehd = (truehd_val[0] == 0   /* default: try passthrough */
-                      || strcmp(truehd_val, "downmix") != 0);
-        }
-        printf("DreamAudio: SW decode (passthrough: ac3=%d eac3=%d dts=%d truehd=%d)\n",
-               pt_ac3, pt_eac3, pt_dts, pt_truehd);
-        aac_software_decoder_set(1);
-        aac_latm_software_decoder_set(1);
-        if (!pt_ac3)    ac3_software_decoder_set(1);
-        if (!pt_eac3)   eac3_software_decoder_set(1);
-        if (!pt_dts)    dts_software_decoder_set(1);
-        if (!pt_truehd) truehd_software_decoder_set(1);
-        mp3_software_decoder_set(1);
-        wma_software_decoder_set(1);
-        vorbis_software_decoder_set(1);
-        opus_software_decoder_set(1);
-        amr_software_decoder_set(1);
-    }
+    /* The dreamaudiod service decodes or passes through what has a PES
+     * writer (AC-3, E-AC-3, DTS, AAC, MPEG audio); the rest goes to it as
+     * PCM. Must run after ParseParams, serviceapp's -a/-n would clear it. */
+    wma_software_decoder_set(1);
+    vorbis_software_decoder_set(1);
+    opus_software_decoder_set(1);
+    amr_software_decoder_set(1);
+    truehd_software_decoder_set(1);
 #endif
 
     ffmpeg_av_dict_set("fake_last_subtitle", "1", 0);
