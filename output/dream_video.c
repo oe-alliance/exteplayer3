@@ -113,9 +113,7 @@ static pthread_mutex_t       dv_mutex       = PTHREAD_MUTEX_INITIALIZER;
 static int                   dv_fd          = -1;
 static int                   dv_poll_fd     = -1;
 static int                   dv_inited      = 0;
-static int                   dv_playing     = 0;
 static unsigned long long    dv_current_pts = 0;
-static uint64_t              dv_frame_index   = 0;
 static uint64_t              dv_frame_dur_ns  = 20000000ULL;   /* 50 fps */
 
 /* Producer/consumer queue between av_read_frame and VIDEO_SET_FRAME. */
@@ -135,6 +133,8 @@ static pthread_cond_t   dv_q_nonfull = PTHREAD_COND_INITIALIZER;
 static pthread_t        dv_q_thread;
 static int              dv_q_running = 0;
 static int              dv_q_stop    = 0;
+/* paused: the consumer holds the queued frames, the decoder is frozen */
+static int              dv_q_paused  = 0;
 
 /* sysfs helpers — best-effort, errors ignored. */
 static void dv_sysfs_write(const char *path, const char *value)
@@ -145,18 +145,6 @@ static void dv_sysfs_write(const char *path, const char *value)
     fclose(f);
 }
 
-static int dv_sysfs_read_int(const char *path, int *out)
-{
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    int v = 0;
-    int n = fscanf(f, "%d", &v);
-    fclose(f);
-    if (n != 1) return -1;
-    *out = v;
-    return 0;
-}
-
 /* dreamvideosink fasst freerun_mode / show_first_frame_nosync nicht an
  * (runtime strace bestätigt). Wir auch nicht. disable_video=0 reicht
  * damit das video plane sichtbar wird. */
@@ -164,15 +152,6 @@ static void dv_enable_display(void)
 {
     dv_sysfs_write("/sys/class/video/disable_video", "0");
 }
-
-static void dv_restore_display(void)
-{
-    /* no-op */
-}
-
-/* keep signal-handler stub for forward compat — no async sysfs restore needed */
-static void dv_install_signal_handlers(void) { }
-
 
 static int dv_streamtype_for(int bcm_streamtype, int *out)
 {
@@ -215,7 +194,11 @@ static int dv_q_push(uint8_t *data, size_t size, int64_t pts_90k)
     deadline.tv_nsec += 500000000L;
     if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
     while (dv_q_is_full_locked() && !dv_q_stop) {
-        if (pthread_cond_timedwait(&dv_q_nonfull, &dv_q_mu, &deadline) != 0) break;
+        /* a paused queue keeps its frames */
+        if (dv_q_paused)
+            pthread_cond_wait(&dv_q_nonfull, &dv_q_mu);
+        else if (pthread_cond_timedwait(&dv_q_nonfull, &dv_q_mu, &deadline) != 0)
+            break;
     }
     if (dv_q_is_full_locked() || dv_q_stop) {
         pthread_mutex_unlock(&dv_q_mu);
@@ -234,7 +217,7 @@ static int dv_q_push(uint8_t *data, size_t size, int64_t pts_90k)
 static int dv_q_pop(uint8_t **data_out, size_t *size_out, int64_t *pts_out)
 {
     pthread_mutex_lock(&dv_q_mu);
-    while (dv_q_is_empty_locked() && !dv_q_stop) {
+    while ((dv_q_is_empty_locked() || dv_q_paused) && !dv_q_stop) {
         pthread_cond_wait(&dv_q_nonemp, &dv_q_mu);
     }
     if (dv_q_stop && dv_q_is_empty_locked()) {
@@ -259,6 +242,7 @@ static void dv_q_drain(void)
         dv_q_tail = (dv_q_tail + 1) % DV_Q_CAP;
     }
     dv_q_head = dv_q_tail = 0;
+    pthread_cond_broadcast(&dv_q_nonfull);
     pthread_mutex_unlock(&dv_q_mu);
 }
 
@@ -299,10 +283,6 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
         int rc = ioctl(fd, VIDEO_SET_FRAME, &fr);
         if (rc >= 0) {
             dv_st_submitted++;
-            /* Poll VIDEO_GET_PTS — gstplayer macht das ständig nach SET_FRAME,
-             * lest den kernel-side video pts aus. */
-            uint64_t vp = 0;
-            (void)ioctl(fd, VIDEO_GET_PTS, &vp);
             return 0;
         }
         if (errno != EAGAIN) {
@@ -325,12 +305,8 @@ static uint64_t dv_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* Submit frames as fast as the kernel video ringbuffer accepts them.
- * Backpressure comes from dv_submit_frame's EAGAIN+poll loop. gstplayer
- * runs the same pattern; sampling N360 showed vstream_cache ≈ 550 kB
- * (≈ 3-4 frames ahead) for gstplayer vs ≈ 12 kB (avg 0.1 frame ahead)
- * for our previous paced submission — the paced path left the kernel
- * pacer one demuxer hiccup away from a drop on every frame. */
+/* Submit frames as fast as the kernel video ringbuffer accepts them;
+ * backpressure comes from dv_submit_frame's EAGAIN+poll loop. */
 static void *dv_consumer_main(void *arg)
 {
     char tn[16] = "dv_consumer";
@@ -338,7 +314,6 @@ static void *dv_consumer_main(void *arg)
     prctl(PR_SET_NAME, (unsigned long)tn, 0, 0, 0);
 
     int64_t  pts_90k_mono = 0;     /* fallback when stream PTS missing */
-    int64_t  last_stream_pts = -1; /* discontinuity tracking */
     dv_st_last_log_ns = dv_now_ns();
     while (!dv_q_stop) {
         uint8_t *buf = NULL;
@@ -349,26 +324,10 @@ static void *dv_consumer_main(void *arg)
         int qd = dv_q_depth_locked();
         pthread_mutex_unlock(&dv_q_mu);
 
-        /* Use stream PTS to match the audio path's timebase. Kernel
-         * tsync compares pts_video to pts_audio — if they're in
-         * different bases (monotonic vs stream) it sees huge fake
-         * drift and drops video to "catch up". On big PTS jumps
-         * (stitcher boundary > 5 s) signal tsync discontinuity so the
-         * kernel re-anchors instead of stalling. */
+        /* the stream PTS, the kernel runs the system clock from it */
         int64_t fr_pts = pts_container;
-        if (fr_pts < 0) {
+        if (fr_pts < 0)
             fr_pts = pts_90k_mono;
-        } else if (last_stream_pts >= 0) {
-            int64_t jump = fr_pts - last_stream_pts;
-            if (jump < -450000 || jump > 450000) {  /* ±5 s @ 90 kHz */
-                DV_DBG("stream PTS discontinuity: %lld → %lld (%+.2fs) — signalling tsync",
-                       (long long)last_stream_pts, (long long)fr_pts,
-                       (double)jump / 90000.0);
-                int fd = open("/sys/class/tsync/discontinue", O_WRONLY | O_CLOEXEC);
-                if (fd >= 0) { (void)write(fd, "1", 1); close(fd); }
-            }
-        }
-        last_stream_pts = fr_pts;
 
         if (dv_fd >= 0) dv_submit_frame(dv_fd, buf, sz, fr_pts);
         free(buf);
@@ -397,6 +356,7 @@ static void dv_q_start(void)
 {
     if (dv_q_running) return;
     dv_q_stop    = 0;
+    dv_q_paused  = 0;
     dv_q_head    = dv_q_tail = 0;
     if (pthread_create(&dv_q_thread, NULL, dv_consumer_main, NULL) == 0) {
         dv_q_running = 1;
@@ -433,7 +393,6 @@ static int DreamVideoOpen(Context_t *context, char *type)
             pthread_mutex_unlock(&dv_mutex);
             return cERR_DREAMVIDEO_ERROR;
         }
-        dv_install_signal_handlers();
         dv_q_start();
         dv_poll_fd = open(AMPOLL_DEV, O_RDWR | O_NONBLOCK);
         if (dv_poll_fd < 0)
@@ -450,8 +409,6 @@ static int DreamVideoOpen(Context_t *context, char *type)
             DV_DBG("FREEZE failed: %s", strerror(errno));
     }
     dv_inited = 0;
-    dv_playing = 0;
-    dv_frame_index = 0;
     dv_frame_dur_ns = 20000000ULL;
     pthread_mutex_unlock(&dv_mutex);
     return cERR_DREAMVIDEO_NO_ERROR;
@@ -461,10 +418,7 @@ static int DreamVideoClose(Context_t *context, char *type)
 {
     if (strcmp(type, "video") != 0) return cERR_DREAMVIDEO_NO_ERROR;
 
-    /* Shut down the consumer thread before closing the fd. Drop the
-     * outer mutex first so the consumer (which holds dv_q_mu) can
-     * make forward progress. */
-    pthread_mutex_unlock(&dv_mutex);
+    /* Shut down the consumer thread before closing the fd. */
     dv_q_shutdown();
     pthread_mutex_lock(&dv_mutex);
     if (dv_fd >= 0) {
@@ -478,9 +432,7 @@ static int DreamVideoClose(Context_t *context, char *type)
         close(dv_poll_fd);
         dv_poll_fd = -1;
     }
-    dv_restore_display();
     dv_inited = 0;
-    dv_playing = 0;
     dv_current_pts = 0;
     pthread_mutex_unlock(&dv_mutex);
     DV_DBG("closed");
@@ -490,9 +442,21 @@ static int DreamVideoClose(Context_t *context, char *type)
 static int DreamVideoPlay(Context_t *context, char *type)
 {
     /* Actual VIDEO_PLAY happens after SET_DEC_SYSINFO in dv_lazy_init. */
+    return cERR_DREAMVIDEO_NO_ERROR;
+}
+
+/* the audio pause holds the system clock (dreamaudio device), the
+ * consumer holds the queued frames */
+static int DreamVideoPause(char *type, int pause)
+{
     if (strcmp(type, "video") != 0) return cERR_DREAMVIDEO_NO_ERROR;
+    pthread_mutex_lock(&dv_q_mu);
+    dv_q_paused = pause;
+    pthread_cond_broadcast(&dv_q_nonemp);
+    pthread_mutex_unlock(&dv_q_mu);
     pthread_mutex_lock(&dv_mutex);
-    dv_playing = 1;
+    if (dv_fd >= 0 && ioctl(dv_fd, pause ? VIDEO_FREEZE : VIDEO_CONTINUE, (void *)(uintptr_t)0) < 0)
+        DV_DBG("%s failed: %s", pause ? "VIDEO_FREEZE" : "VIDEO_CONTINUE", strerror(errno));
     pthread_mutex_unlock(&dv_mutex);
     return cERR_DREAMVIDEO_NO_ERROR;
 }
@@ -502,10 +466,16 @@ static int DreamVideoStop(Context_t *context, char *type)
     return DreamVideoClose(context, type);
 }
 
+/* the frame on screen; the queue runs seconds ahead of it */
 static int DreamVideoPts(Context_t *context, unsigned long long *pts)
 {
+    uint64_t vp = 0;
+
     pthread_mutex_lock(&dv_mutex);
-    *pts = dv_current_pts;
+    if (dv_fd >= 0 && ioctl(dv_fd, VIDEO_GET_PTS, &vp) == 0 && vp)
+        *pts = vp;
+    else
+        *pts = dv_current_pts;
     pthread_mutex_unlock(&dv_mutex);
     return cERR_DREAMVIDEO_NO_ERROR;
 }
@@ -575,8 +545,6 @@ static int dv_lazy_init(Context_t *context, AudioVideoOut_t *out)
 static ssize_t dv_set_frame_writev(int fd, const struct iovec *iov, int iovcnt)
 {
     (void)fd;
-    (void)dv_frame_index;
-    (void)dv_frame_dur_ns;
 
     /* Coalesce iovec and hand off to the consumer thread. */
     size_t total = 0;
@@ -644,6 +612,8 @@ static int DreamVideoWrite(void *_context, void *_out)
         pthread_mutex_unlock(&dv_mutex);
         return cERR_DREAMVIDEO_ERROR;
     }
+    /* the queue may wait for room; position, pause and flush must not */
+    pthread_mutex_unlock(&dv_mutex);
 
     WriterAVCallData_t call;
     memset(&call, 0, sizeof(call));
@@ -663,7 +633,6 @@ static int DreamVideoWrite(void *_context, void *_out)
     call.WriteV       = dv_set_frame_writev;
 
     int res = writer->writeData(&call);
-    pthread_mutex_unlock(&dv_mutex);
 
     if (res < 0) {
         DV_DBG("writeData %u bytes failed: %s", out->len, strerror(errno));
@@ -686,18 +655,13 @@ static int DreamVideoCommand(void *_context, OutputCmd_t cmd, void *arg)
     case OUTPUT_PTS:     return DreamVideoPts(context, (unsigned long long *)arg);
     case OUTPUT_FLUSH:
     case OUTPUT_CLEAR:
-        /* Drain queue + clear kernel ring + signal tsync discontinuity. */
         pthread_mutex_lock(&dv_mutex);
         dv_q_drain();
         if (dv_fd >= 0) (void)ioctl(dv_fd, VIDEO_CLEAR_BUFFER);
         pthread_mutex_unlock(&dv_mutex);
-        {
-            int fd = open("/sys/class/tsync/discontinue", O_WRONLY | O_CLOEXEC);
-            if (fd >= 0) { (void)write(fd, "1", 1); close(fd); }
-        }
         return cERR_DREAMVIDEO_NO_ERROR;
-    case OUTPUT_PAUSE:
-    case OUTPUT_CONTINUE:
+    case OUTPUT_PAUSE:    return DreamVideoPause((char *)arg, 1);
+    case OUTPUT_CONTINUE: return DreamVideoPause((char *)arg, 0);
     case OUTPUT_SWITCH:
     case OUTPUT_AVSYNC:
     case OUTPUT_SLOWMOTION:
