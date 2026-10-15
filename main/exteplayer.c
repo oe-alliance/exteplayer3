@@ -426,6 +426,22 @@ static int kbhit(void)
     return 0;
 }
 
+/* Non-blocking read of a command. A closed command pipe means the
+ * parent is gone, read it as the stop command. */
+static char *ReadCommand(char *buff, int size)
+{
+    struct stat st;
+
+    if (fgets(buff, size, stdin))
+        return buff;
+    if (feof(stdin) && 0 == fstat(0, &st) && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)))
+    {
+        strcpy(buff, "q\n");
+        return buff;
+    }
+    return NULL;
+}
+
 static void SetBuffering()
 {
     static char buff[2048];
@@ -1023,7 +1039,7 @@ int main(int argc, char* argv[])
 
     	while( params.init_finished == 0 )
     	{
-            if( NULL == fgets(argvBuff, sizeof(argvBuff)-1 , stdin) )
+            if( NULL == ReadCommand(argvBuff, sizeof(argvBuff)-1) )
             {
                 /* wait for data - max 1s */
                 kbhit();
@@ -1101,7 +1117,7 @@ int main(int argc, char* argv[])
         while(g_player->playback->isPlaying && 0 == PlaybackDieNow(0))
         {
             /* we made fgets non blocking */
-            if( NULL == fgets(argvBuff, sizeof(argvBuff)-1 , stdin) )
+            if( NULL == ReadCommand(argvBuff, sizeof(argvBuff)-1) )
             {
                 /* wait for data - max 1s */
                 kbhit();
