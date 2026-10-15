@@ -118,6 +118,7 @@ static uint64_t              dv_frame_dur_ns  = 20000000ULL;   /* 50 fps */
 
 /* Producer/consumer queue between av_read_frame and VIDEO_SET_FRAME. */
 #define DV_Q_CAP   256              /* ~5 s @ 50 fps */
+#define DV_STALL_MS 1200            /* video PTS stands still while the clock runs */
 typedef struct {
     uint8_t *data;
     size_t   size;
@@ -188,19 +189,11 @@ static int dv_q_depth_locked(void)
 static int dv_q_push(uint8_t *data, size_t size, int64_t pts_90k)
 {
     pthread_mutex_lock(&dv_q_mu);
-    /* Bounded wait: 500 ms max, then drop rather than hang. */
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_nsec += 500000000L;
-    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
-    while (dv_q_is_full_locked() && !dv_q_stop) {
-        /* a paused queue keeps its frames */
-        if (dv_q_paused)
-            pthread_cond_wait(&dv_q_nonfull, &dv_q_mu);
-        else if (pthread_cond_timedwait(&dv_q_nonfull, &dv_q_mu, &deadline) != 0)
-            break;
-    }
-    if (dv_q_is_full_locked() || dv_q_stop) {
+    /* Wait for room, a dropped frame breaks the H.264 reference chain.
+     * The consumer waits for the decoder, so a full queue is normal. */
+    while (dv_q_is_full_locked() && !dv_q_stop)
+        pthread_cond_wait(&dv_q_nonfull, &dv_q_mu);
+    if (dv_q_stop) {
         pthread_mutex_unlock(&dv_q_mu);
         free(data);
         return -1;
@@ -248,11 +241,28 @@ static void dv_q_drain(void)
 
 /* Periodic stats — sampled by dv_consumer_main. */
 static uint64_t dv_st_submitted = 0;   /* SET_FRAME calls that returned ok */
-static uint64_t dv_st_dropped   = 0;   /* SET_FRAME calls that gave up after 250ms */
+static uint64_t dv_st_dropped   = 0;   /* video buffer clears after a decoder stall */
 static uint64_t dv_st_eagain_pollin = 0;
 static uint64_t dv_st_last_log_ns = 0;
 static uint64_t dv_st_last_submitted = 0;
 static uint64_t dv_st_last_dropped   = 0;
+
+/* a tsync value, the PTS on screen or the system clock */
+static uint64_t dv_tsync_read(const char *path)
+{
+    char buf[32];
+    uint64_t pts = 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = 0;
+            pts = strtoull(buf, NULL, 0);
+        }
+        close(fd);
+    }
+    return pts;
+}
 
 /* dreamvideosink (runtime strace):
  *   - öffnet video0 mit O_NONBLOCK
@@ -278,7 +288,14 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
     pfds[1].fd = dv_poll_fd;     pfds[1].events = POLLIN;
     int nfds = (dv_poll_fd >= 0) ? 2 : 1;
 
-    int total_wait_ms = 0;
+    /* Wait for the decoder instead of dropping: a full buffer is normal
+     * backpressure, and a dropped H.264 frame breaks the reference chain
+     * so the decoder resets on the frame number gap. Only a stop request
+     * or a decoder whose PTS stands still for DV_STALL_MS while the
+     * clock runs ends the wait. */
+    struct timespec t0, t;
+    uint64_t last_pts = 0, pcr0 = 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     for (;;) {
         int rc = ioctl(fd, VIDEO_SET_FRAME, &fr);
         if (rc >= 0) {
@@ -289,11 +306,32 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
             DV_DBG("VIDEO_SET_FRAME (%zu bytes) failed: %s", size, strerror(errno));
             return -1;
         }
+        if (__atomic_load_n(&dv_q_stop, __ATOMIC_RELAXED))
+            return -1;
         int pr = poll(pfds, nfds, 50);
-        if (pr > 0) dv_st_eagain_pollin++;
-        if (pr <= 0) {
-            total_wait_ms += 50;
-            if (total_wait_ms > 250) { dv_st_dropped++; return 0; }
+        if (pr > 0) {
+            dv_st_eagain_pollin++;
+            /* readable but still full: take the event, do not spin */
+            (void)ioctl(fd, VIDEO_GET_EVENT, dv_event_buf);
+            usleep(5000);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        /* VIDEO_GET_PTS returns a cached value while the buffer is full */
+        uint64_t vpts = dv_tsync_read("/sys/class/tsync/pts_video");
+        uint64_t pcr = dv_tsync_read("/sys/class/tsync/pts_pcrscr");
+        if (vpts != last_pts || __atomic_load_n(&dv_q_paused, __ATOMIC_RELAXED)) {
+            /* frames still change, or a pause */
+            last_pts = vpts;
+            pcr0 = pcr;
+            t0 = t;
+        }
+        long waited_ms = (t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000;
+        /* a stall only counts while the clock runs on */
+        if (waited_ms > DV_STALL_MS && (int64_t)(pcr - pcr0) > DV_STALL_MS * 45LL) {
+            DV_DBG("decoder stalled, video PTS stood still for %ld ms, clearing the video buffer", waited_ms);
+            (void)ioctl(fd, VIDEO_CLEAR_BUFFER);
+            dv_st_dropped++;
+            return 0;
         }
     }
 }
