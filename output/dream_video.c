@@ -119,6 +119,7 @@ static uint64_t              dv_frame_dur_ns  = 20000000ULL;   /* 50 fps */
 /* Producer/consumer queue between av_read_frame and VIDEO_SET_FRAME. */
 #define DV_Q_CAP   256              /* ~5 s @ 50 fps */
 #define DV_STALL_MS 1200            /* video PTS stands still while the clock runs */
+#define DV_LEAD_90K (2 * 90000)     /* frames written ahead of the frame on screen */
 typedef struct {
     uint8_t *data;
     size_t   size;
@@ -136,6 +137,7 @@ static int              dv_q_running = 0;
 static int              dv_q_stop    = 0;
 /* paused: the consumer holds the queued frames, the decoder is frozen */
 static int              dv_q_paused  = 0;
+static uint64_t         dv_flush_vpts = 0;   /* PTS on screen at the last flush */
 
 /* sysfs helpers — best-effort, errors ignored. */
 static void dv_sysfs_write(const char *path, const char *value)
@@ -330,6 +332,7 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
         if (waited_ms > DV_STALL_MS && (int64_t)(pcr - pcr0) > DV_STALL_MS * 45LL) {
             DV_DBG("decoder stalled, video PTS stood still for %ld ms, clearing the video buffer", waited_ms);
             (void)ioctl(fd, VIDEO_CLEAR_BUFFER);
+            __atomic_store_n(&dv_flush_vpts, dv_tsync_read("/sys/class/tsync/pts_video"), __ATOMIC_RELAXED);
             dv_st_dropped++;
             return 0;
         }
@@ -343,8 +346,36 @@ static uint64_t dv_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* Submit frames as fast as the kernel video ringbuffer accepts them;
- * backpressure comes from dv_submit_frame's EAGAIN+poll loop. */
+/* Hold a frame until it is at most DV_LEAD_90K ahead of the frame on
+ * screen. A write that waits long for room ends in a write timeout, after
+ * which the driver drops every frame until a flush. The system clock lags
+ * behind a seek, the PTS on screen does not. Free until the decoder shows
+ * frames after a flush, and while it stands without a pause, the stall
+ * check in dv_submit_frame handles that. */
+static void dv_wait_lead(int64_t pts_90k)
+{
+    static uint64_t last_vpts = 0;  /* consumer thread only */
+    static int still_ms = 0;
+    while (!__atomic_load_n(&dv_q_stop, __ATOMIC_RELAXED)) {
+        if (!__atomic_load_n(&dv_q_paused, __ATOMIC_RELAXED)) {
+            uint64_t vpts = dv_tsync_read("/sys/class/tsync/pts_video");
+            if (pts_90k < 0 || vpts == __atomic_load_n(&dv_flush_vpts, __ATOMIC_RELAXED))
+                return;
+            int32_t lead = (int32_t)((uint32_t)pts_90k - (uint32_t)vpts);
+            /* far off is a jump, the decoder sorts it out */
+            if (lead <= DV_LEAD_90K || lead > 10 * 90000)
+                return;
+            still_ms = (vpts == last_vpts) ? still_ms + 10 : 0;
+            if (still_ms > DV_STALL_MS)
+                return;
+            last_vpts = vpts;
+        }
+        usleep(10000);
+    }
+}
+
+/* Submit frames up to DV_LEAD_90K ahead of the frame on screen;
+ * backpressure comes from dv_wait_lead and dv_submit_frame. */
 static void *dv_consumer_main(void *arg)
 {
     char tn[16] = "dv_consumer";
@@ -367,6 +398,7 @@ static void *dv_consumer_main(void *arg)
         if (fr_pts < 0)
             fr_pts = pts_90k_mono;
 
+        dv_wait_lead(fr_pts);
         if (dv_fd >= 0) dv_submit_frame(dv_fd, buf, sz, fr_pts);
         free(buf);
         pts_90k_mono += (int64_t)(dv_frame_dur_ns * 90 / 1000000);
@@ -376,10 +408,10 @@ static void *dv_consumer_main(void *arg)
             uint64_t s_delta = dv_st_submitted - dv_st_last_submitted;
             uint64_t d_delta = dv_st_dropped   - dv_st_last_dropped;
             double secs = (double)(now - dv_st_last_log_ns) / 1e9;
-            DV_DBG("stats: submitted=%llu (+%llu, %.1f/s) dropped=%llu (+%llu, %.1f/s) qdepth=%d frame_dur=%llums pts_inc=%lld",
+            DV_DBG("stats: submitted=%llu (+%llu, %.1f/s) dropped=%llu (+%llu, %.1f/s) qdepth=%d lead=%dms frame_dur=%llums pts_inc=%lld",
                    (unsigned long long)dv_st_submitted, (unsigned long long)s_delta, s_delta/secs,
                    (unsigned long long)dv_st_dropped, (unsigned long long)d_delta, d_delta/secs,
-                   qd,
+                   qd, (int32_t)((uint32_t)fr_pts - (uint32_t)dv_tsync_read("/sys/class/tsync/pts_video")) / 90,
                    (unsigned long long)(dv_frame_dur_ns/1000000ULL),
                    (long long)(dv_frame_dur_ns * 90LL / 1000000LL));
             dv_st_last_submitted = dv_st_submitted;
@@ -396,6 +428,7 @@ static void dv_q_start(void)
     dv_q_stop    = 0;
     dv_q_paused  = 0;
     dv_q_head    = dv_q_tail = 0;
+    dv_flush_vpts = dv_tsync_read("/sys/class/tsync/pts_video");
     if (pthread_create(&dv_q_thread, NULL, dv_consumer_main, NULL) == 0) {
         dv_q_running = 1;
     } else {
@@ -696,6 +729,7 @@ static int DreamVideoCommand(void *_context, OutputCmd_t cmd, void *arg)
         pthread_mutex_lock(&dv_mutex);
         dv_q_drain();
         if (dv_fd >= 0) (void)ioctl(dv_fd, VIDEO_CLEAR_BUFFER);
+        __atomic_store_n(&dv_flush_vpts, dv_tsync_read("/sys/class/tsync/pts_video"), __ATOMIC_RELAXED);
         pthread_mutex_unlock(&dv_mutex);
         return cERR_DREAMVIDEO_NO_ERROR;
     case OUTPUT_PAUSE:    return DreamVideoPause((char *)arg, 1);
