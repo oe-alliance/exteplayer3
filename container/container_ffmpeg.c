@@ -2246,6 +2246,33 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
             }
         }
 
+        /* DASH lists every video representation as a stream and only the
+         * first video track plays: take the best one, as the HLS variants */
+        int32_t bestVideo = -1;
+        if (0 == strncmp(avContext->iformat->name, "dash", 4) && !av_dict_get(g_avio_opts, "video_rep_index", NULL, 0))
+        {
+            int64_t bestScore = -1;
+            int64_t bestRate = -1;
+            uint32_t i;
+            for (i = 0; i < avContext->nb_streams; i++)
+            {
+                AVCodecParameters *par = get_codecpar(avContext->streams[i]);
+                AVRational rate = get_frame_rate(avContext->streams[i]);
+                int64_t score;
+
+                if (par->codec_type != AVMEDIA_TYPE_VIDEO)
+                    continue;
+                score = (int64_t)par->width * par->height * (rate.den ? 1000 * rate.num / rate.den : 25000);
+                if (score > bestScore || (score == bestScore && par->bit_rate > bestRate))
+                {
+                    bestScore = score;
+                    bestRate = par->bit_rate;
+                    bestVideo = i;
+                }
+            }
+            ffmpeg_printf(1, "cAVIdx[%d]: DASH video stream %d\n", cAVIdx, bestVideo);
+        }
+
         int32_t n = 0;
         for (n = 0; n < avContext->nb_streams; n++)
         {
@@ -2253,6 +2280,12 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
             AVStream *stream = avContext->streams[n];
             int32_t version = 0;
             char *encoding = NULL;
+
+            if (bestVideo >= 0 && n != bestVideo && get_codecpar(stream)->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
+                stream->discard = AVDISCARD_ALL;
+                continue;
+            }
 
             if (nb_stream_indexes > 0 && stream_index != NULL)
             {
