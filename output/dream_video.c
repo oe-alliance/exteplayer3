@@ -88,6 +88,9 @@ struct video_frame {
     int            is_phys_addr[8];
 };
 
+/* video_frame.pts of the rest of a frame the driver took only in part */
+#define DV_PTS_NONE UINT64_MAX
+
 #define VIDEO_SET_DEC_SYSINFO  _IOWR('o', 65, struct dec_sysinfo)
 #define VIDEO_SET_FRAME        _IOWR('o', 64, struct video_frame)
 
@@ -298,13 +301,21 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
     struct timespec t0, t;
     uint64_t last_pts = 0, pcr0 = 0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    size_t offset = 0;
     for (;;) {
         int rc = ioctl(fd, VIDEO_SET_FRAME, &fr);
         if (rc >= 0) {
-            dv_st_submitted++;
-            return 0;
-        }
-        if (errno != EAGAIN) {
+            /* the driver takes what fits and returns the byte count; the
+             * rest follows without a PTS once there is room */
+            offset += (size_t)rc;
+            if (offset >= size) {
+                dv_st_submitted++;
+                return 0;
+            }
+            fr.pts      = DV_PTS_NONE;
+            fr.bytes[0] = (ssize_t)(size - offset);
+            fr.data[0]  = data + offset;
+        } else if (errno != EAGAIN) {
             DV_DBG("VIDEO_SET_FRAME (%zu bytes) failed: %s", size, strerror(errno));
             return -1;
         }
