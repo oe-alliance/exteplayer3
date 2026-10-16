@@ -100,11 +100,11 @@ struct video_frame {
 #define EXTERNAL_PTS 1
 #define SYNC_OUTSIDE 2
 
-/* Dream-mapped vstream_type_t for VIDEO_SET_STREAMTYPE (only H.264=1
- * verified; MPEG2 / HEVC are best guesses). */
+/* Dream-mapped vstream_type_t for VIDEO_SET_STREAMTYPE, the values
+ * enigma2 uses for the Dreambox decoders. */
 #define DREAM_STREAMTYPE_MPEG2  0
 #define DREAM_STREAMTYPE_H264   1
-#define DREAM_STREAMTYPE_HEVC   8
+#define DREAM_STREAMTYPE_HEVC   22
 
 static const char VIDEO_DEV[]   = "/dev/dvb/adapter0/video0";
 static const char AMPOLL_DEV[]  = "/dev/amvideo_poll";
