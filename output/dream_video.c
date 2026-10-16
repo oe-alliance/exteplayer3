@@ -107,6 +107,7 @@ struct video_frame {
  * enigma2 uses for the Dreambox decoders. */
 #define DREAM_STREAMTYPE_MPEG2  0
 #define DREAM_STREAMTYPE_H264   1
+#define DREAM_STREAMTYPE_MPEG4  4
 #define DREAM_STREAMTYPE_HEVC   22
 
 static const char VIDEO_DEV[]   = "/dev/dvb/adapter0/video0";
@@ -166,6 +167,7 @@ static int dv_streamtype_for(int bcm_streamtype, int *out)
     case STREAMTYPE_MPEG2:      *out = DREAM_STREAMTYPE_MPEG2; return 0;
     case STREAMTYPE_MPEG1:      *out = DREAM_STREAMTYPE_MPEG2; return 0;
     case STREAMTYPE_MPEG4_H265: *out = DREAM_STREAMTYPE_HEVC; return 0;
+    case STREAMTYPE_MPEG4_Part2: *out = DREAM_STREAMTYPE_MPEG4; return 0;
     default: return -1;
     }
 }
@@ -175,6 +177,7 @@ static int dv_decformat_for(int bcm_streamtype, uint32_t *out)
     switch (bcm_streamtype) {
     case STREAMTYPE_MPEG4_H264: *out = DEC_FORMAT_H264; return 0;
     case STREAMTYPE_MPEG4_H265: *out = DEC_FORMAT_HEVC; return 0;
+    case STREAMTYPE_MPEG4_Part2: *out = DEC_FORMAT_MPEG4_5; return 0;
     case STREAMTYPE_MPEG2:      *out = 0; return 0;
     case STREAMTYPE_MPEG1:      *out = 0; return 0;
     default: return -1;
