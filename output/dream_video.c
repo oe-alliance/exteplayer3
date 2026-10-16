@@ -98,6 +98,7 @@ struct video_frame {
 #define DEC_FORMAT_MPEG4_5  3
 #define DEC_FORMAT_H264     4
 #define DEC_FORMAT_HEVC     15
+#define DEC_FORMAT_VP9      16
 
 /* dec_sysinfo.param flag bits (kept as void *). */
 #define EXTERNAL_PTS 1
@@ -109,6 +110,7 @@ struct video_frame {
 #define DREAM_STREAMTYPE_H264   1
 #define DREAM_STREAMTYPE_MPEG4  4
 #define DREAM_STREAMTYPE_HEVC   22
+#define DREAM_STREAMTYPE_VP9    23
 
 static const char VIDEO_DEV[]   = "/dev/dvb/adapter0/video0";
 static const char AMPOLL_DEV[]  = "/dev/amvideo_poll";
@@ -168,6 +170,7 @@ static int dv_streamtype_for(int bcm_streamtype, int *out)
     case STREAMTYPE_MPEG1:      *out = DREAM_STREAMTYPE_MPEG2; return 0;
     case STREAMTYPE_MPEG4_H265: *out = DREAM_STREAMTYPE_HEVC; return 0;
     case STREAMTYPE_MPEG4_Part2: *out = DREAM_STREAMTYPE_MPEG4; return 0;
+    case STREAMTYPE_VB9:        *out = DREAM_STREAMTYPE_VP9; return 0;
     default: return -1;
     }
 }
@@ -178,6 +181,7 @@ static int dv_decformat_for(int bcm_streamtype, uint32_t *out)
     case STREAMTYPE_MPEG4_H264: *out = DEC_FORMAT_H264; return 0;
     case STREAMTYPE_MPEG4_H265: *out = DEC_FORMAT_HEVC; return 0;
     case STREAMTYPE_MPEG4_Part2: *out = DEC_FORMAT_MPEG4_5; return 0;
+    case STREAMTYPE_VB9:        *out = DEC_FORMAT_VP9; return 0;
     case STREAMTYPE_MPEG2:      *out = 0; return 0;
     case STREAMTYPE_MPEG1:      *out = 0; return 0;
     default: return -1;
@@ -657,6 +661,62 @@ static ssize_t dv_set_frame_writev(int fd, const struct iovec *iov, int iovcnt)
     return (ssize_t)total;
 }
 
+/* ----- VP9 ------------------------------------------------------------ */
+
+static void dv_put_be32(uint8_t *p, uint32_t v)
+{
+    p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
+}
+
+/* The Amlogic VP9 decoder takes each frame behind an AMLV header: length,
+ * inverted length, start code and signature. A superframe is split into
+ * its frames, its index is dropped. */
+static int dv_write_vp9(const uint8_t *data, size_t size)
+{
+    size_t sizes[8] = { size };
+    size_t count = 1, index_size = 0;
+    uint8_t marker = data[size - 1];
+
+    if ((marker & 0xe0) == 0xc0) {
+        size_t n = (marker & 7) + 1, bytes = ((marker >> 3) & 3) + 1;
+        size_t isz = 2 + n * bytes;
+        if (isz <= size && data[size - isz] == marker) {
+            size_t pos = size - isz + 1, total = 0;
+            for (size_t i = 0; i < n; i++) {
+                sizes[i] = 0;
+                for (size_t b = 0; b < bytes; b++)
+                    sizes[i] |= (size_t)data[pos++] << (8 * b);
+                total += sizes[i];
+            }
+            if (total == size - isz) {
+                count = n;
+                index_size = isz;
+            } else {
+                sizes[0] = size;
+            }
+        }
+    }
+
+    size_t total = size - index_size + count * 16;
+    uint8_t *buf = malloc(total);
+    if (!buf) {
+        DV_DBG("malloc(%zu) failed: %s", total, strerror(errno));
+        return -1;
+    }
+    size_t in = 0, out = 0;
+    for (size_t i = 0; i < count; i++) {
+        dv_put_be32(buf + out, (uint32_t)sizes[i] + 4);
+        dv_put_be32(buf + out + 4, ~((uint32_t)sizes[i] + 4));
+        dv_put_be32(buf + out + 8, 1);
+        memcpy(buf + out + 12, "AMLV", 4);
+        memcpy(buf + out + 16, data + in, sizes[i]);
+        out += sizes[i] + 16;
+        in += sizes[i];
+    }
+    (void)dv_q_push(buf, total, (int64_t)dv_current_pts);
+    return 0;
+}
+
 /* ----- Write --------------------------------------------------------- */
 
 static int DreamVideoWrite(void *_context, void *_out)
@@ -699,6 +759,10 @@ static int DreamVideoWrite(void *_context, void *_out)
     }
     /* the queue may wait for room; position, pause and flush must not */
     pthread_mutex_unlock(&dv_mutex);
+
+    /* the VP9 writer packs for Broadcom decoders */
+    if (writer->caps && writer->caps->dvbStreamType == STREAMTYPE_VB9)
+        return dv_write_vp9(out->data, out->len) < 0 ? cERR_DREAMVIDEO_ERROR : cERR_DREAMVIDEO_NO_ERROR;
 
     WriterAVCallData_t call;
     memset(&call, 0, sizeof(call));
