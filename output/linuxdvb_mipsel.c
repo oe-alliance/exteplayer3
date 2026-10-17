@@ -215,6 +215,14 @@ int LinuxDvbOpen(Context_t  *context __attribute__((unused)), char *type)
             linuxdvb_err("AUDIO_SELECT_SOURCE: ERROR %d, %s\n", errno, strerror(errno));
         }
 
+#ifdef HAVE_DREAMNEXTGEN
+        /* the kernel syncs the audio of the dreamaudio device to the video */
+        if (ioctl(audiofd, AUDIO_SET_AV_SYNC, 1) == -1)
+        {
+            linuxdvb_err("AUDIO_SET_AV_SYNC: ERROR %d, %s\n", errno, strerror(errno));
+        }
+#endif
+
         if (ioctl( audiofd, AUDIO_PAUSE) == -1)
         {
             linuxdvb_err("AUDIO_PAUSE: ERROR %d, %s\n", errno, strerror(errno));
@@ -536,7 +544,11 @@ int LinuxDvbAVSync(Context_t  *context, char *type __attribute__((unused))) {
     if (audiofd != -1) {
         getLinuxDVBMutex();
 
+#ifdef HAVE_DREAMNEXTGEN
+        if (ioctl(audiofd, AUDIO_SET_AV_SYNC, 1) == -1)
+#else
         if (ioctl(audiofd, AUDIO_SET_AV_SYNC, 0) == -1) //context->playback->AVSync) == -1)
+#endif
         {
             linuxdvb_err("AUDIO_SET_AV_SYNC: ERROR %d, %s\n", errno, strerror(errno));
             ret = cERR_LINUXDVB_ERROR;
