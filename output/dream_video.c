@@ -561,10 +561,11 @@ static int DreamVideoPts(Context_t *context, unsigned long long *pts)
     uint64_t vp = 0;
 
     pthread_mutex_lock(&dv_mutex);
-    if (dv_fd >= 0 && ioctl(dv_fd, VIDEO_GET_PTS, &vp) == 0 && vp)
-        *pts = vp;
-    else
-        *pts = dv_current_pts;
+    /* the frame on screen; the last written frame runs far ahead of it on a
+     * fast source, and VIDEO_GET_PTS gives nothing for a while after a pause */
+    if (dv_fd < 0 || ioctl(dv_fd, VIDEO_GET_PTS, &vp) != 0 || !vp)
+        vp = dv_tsync_read("/sys/class/tsync/pts_video");
+    *pts = vp ? vp : dv_current_pts;
     pthread_mutex_unlock(&dv_mutex);
     return cERR_DREAMVIDEO_NO_ERROR;
 }
