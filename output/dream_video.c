@@ -95,6 +95,7 @@ struct video_frame {
 #define VIDEO_SET_FRAME        _IOWR('o', 64, struct video_frame)
 
 /* vdec_type_t — packed into dec_sysinfo.format. */
+#define DEC_FORMAT_MPEG4_3  1
 #define DEC_FORMAT_MPEG4_5  3
 #define DEC_FORMAT_H264     4
 #define DEC_FORMAT_HEVC     15
@@ -170,6 +171,7 @@ static int dv_streamtype_for(int bcm_streamtype, int *out)
     case STREAMTYPE_MPEG1:      *out = DREAM_STREAMTYPE_MPEG2; return 0;
     case STREAMTYPE_MPEG4_H265: *out = DREAM_STREAMTYPE_HEVC; return 0;
     case STREAMTYPE_MPEG4_Part2: *out = DREAM_STREAMTYPE_MPEG4; return 0;
+    case STREAMTYPE_DIVX311:    *out = DREAM_STREAMTYPE_MPEG4; return 0;
     case STREAMTYPE_VB9:        *out = DREAM_STREAMTYPE_VP9; return 0;
     default: return -1;
     }
@@ -181,6 +183,7 @@ static int dv_decformat_for(int bcm_streamtype, uint32_t *out)
     case STREAMTYPE_MPEG4_H264: *out = DEC_FORMAT_H264; return 0;
     case STREAMTYPE_MPEG4_H265: *out = DEC_FORMAT_HEVC; return 0;
     case STREAMTYPE_MPEG4_Part2: *out = DEC_FORMAT_MPEG4_5; return 0;
+    case STREAMTYPE_DIVX311:    *out = DEC_FORMAT_MPEG4_3; return 0;
     case STREAMTYPE_VB9:        *out = DEC_FORMAT_VP9; return 0;
     case STREAMTYPE_MPEG2:      *out = 0; return 0;
     case STREAMTYPE_MPEG1:      *out = 0; return 0;
@@ -718,6 +721,40 @@ static int dv_write_vp9(const uint8_t *data, size_t size)
     return 0;
 }
 
+/* ----- DivX 3.11 ------------------------------------------------------ */
+
+/* the picture size goes ahead of the first frame after a start or flush */
+static int dv_divx3_header = 1;
+
+/* The Amlogic decoder takes each DivX 3.11 frame behind a start code with
+ * the signature and the frame length. */
+static int dv_write_divx3(const uint8_t *data, size_t size, uint32_t width, uint32_t height)
+{
+    size_t head = dv_divx3_header ? 10 : 0;
+    size_t total = head + 13 + 4 + size;
+    uint8_t *buf = malloc(total);
+    if (!buf) {
+        DV_DBG("malloc(%zu) failed: %s", total, strerror(errno));
+        return -1;
+    }
+    if (head) {
+        uint32_t dimensions = width << 12 | height;
+        dv_put_be32(buf, 1);
+        buf[4] = 0x20;
+        buf[5] = dimensions >> 16;
+        buf[6] = dimensions >> 8;
+        buf[7] = dimensions;
+        buf[8] = 0;
+        buf[9] = 0;
+        dv_divx3_header = 0;
+    }
+    memcpy(buf + head, "\x00\x00\x00\x01\xb6" "DIVX3.11", 13);
+    dv_put_be32(buf + head + 13, (uint32_t)size);
+    memcpy(buf + head + 17, data, size);
+    (void)dv_q_push(buf, total, (int64_t)dv_current_pts);
+    return 0;
+}
+
 /* ----- Write --------------------------------------------------------- */
 
 static int DreamVideoWrite(void *_context, void *_out)
@@ -764,6 +801,8 @@ static int DreamVideoWrite(void *_context, void *_out)
     /* the VP9 writer packs for Broadcom decoders */
     if (writer->caps && writer->caps->dvbStreamType == STREAMTYPE_VB9)
         return dv_write_vp9(out->data, out->len) < 0 ? cERR_DREAMVIDEO_ERROR : cERR_DREAMVIDEO_NO_ERROR;
+    if (writer->caps && writer->caps->dvbStreamType == STREAMTYPE_DIVX311)
+        return dv_write_divx3(out->data, out->len, out->width, out->height) < 0 ? cERR_DREAMVIDEO_ERROR : cERR_DREAMVIDEO_NO_ERROR;
 
     WriterAVCallData_t call;
     memset(&call, 0, sizeof(call));
@@ -808,6 +847,7 @@ static int DreamVideoCommand(void *_context, OutputCmd_t cmd, void *arg)
         pthread_mutex_lock(&dv_mutex);
         dv_q_drain();
         if (dv_fd >= 0) (void)ioctl(dv_fd, VIDEO_CLEAR_BUFFER);
+        dv_divx3_header = 1;
         __atomic_store_n(&dv_flush_vpts, dv_tsync_read("/sys/class/tsync/pts_video"), __ATOMIC_RELAXED);
         pthread_mutex_unlock(&dv_mutex);
         return cERR_DREAMVIDEO_NO_ERROR;

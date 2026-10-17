@@ -405,9 +405,15 @@ static char* Codec2Encoding(int32_t codec_id, int32_t media_type, uint8_t *extra
 #if LIBAVCODEC_VERSION_MAJOR < 53
     case AV_CODEC_ID_XVID:
 #endif
+#ifdef HAVE_DREAMNEXTGEN
+    case AV_CODEC_ID_MSMPEG4V3:
+        return "V_DIVX3";
+#endif
     case AV_CODEC_ID_MSMPEG4V1:
     case AV_CODEC_ID_MSMPEG4V2:
+#ifndef HAVE_DREAMNEXTGEN
     case AV_CODEC_ID_MSMPEG4V3:
+#endif
         return "V_MPEG4"; //"V_DIVX3";
     case AV_CODEC_ID_WMV1:
         *version = 1;
