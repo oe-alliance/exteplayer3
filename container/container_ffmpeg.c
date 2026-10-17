@@ -2271,7 +2271,44 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
 
         ffmpeg_printf(1, "cAVIdx[%d]: number of streams: %d\n", cAVIdx, avContext->nb_streams);
 
-        if (avContext->nb_programs > 0)
+#ifdef HAVE_DREAMNEXTGEN
+        /* HLS lists the variants as programs, the lowest often first: take
+         * the one with the best video, then the highest bitrate */
+        if (avContext->nb_programs > 1 && g_sel_program_id <= 0 && 0 == strcmp(avContext->iformat->name, "hls"))
+        {
+            int64_t bestScore = -1;
+            int64_t bestRate = -1;
+            uint32_t n;
+            for (n = 0; n < avContext->nb_programs; n++)
+            {
+                AVProgram *p = avContext->programs[n];
+                AVDictionaryEntry *e = av_dict_get(p->metadata, "variant_bitrate", NULL, 0);
+                int64_t rate = e ? strtoll(e->value, NULL, 10) : 0;
+                uint32_t m;
+                for (m = 0; m < p->nb_stream_indexes; m++)
+                {
+                    AVStream *s = avContext->streams[p->stream_index[m]];
+                    AVCodecParameters *par = get_codecpar(s);
+                    AVRational fps = get_frame_rate(s);
+                    int64_t score;
+
+                    if (par->codec_type != AVMEDIA_TYPE_VIDEO || par->width <= 0)
+                        continue;
+                    score = (int64_t)par->width * par->height * (fps.den ? 1000 * fps.num / fps.den : 25000);
+                    if (score > bestScore || (score == bestScore && rate > bestRate))
+                    {
+                        bestScore = score;
+                        bestRate = rate;
+                        stream_index = p->stream_index;
+                        nb_stream_indexes = p->nb_stream_indexes;
+                    }
+                    break;
+                }
+            }
+            ffmpeg_printf(1, "cAVIdx[%d]: HLS variant with %lld bit/s\n", cAVIdx, (long long)bestRate);
+        }
+#endif
+        if (avContext->nb_programs > 0 && (0 == nb_stream_indexes || stream_index == NULL))
         {
             uint32_t n = 0;
             ffmpeg_printf(1, "cAVIdx[%d]: stream with multi programs: num of programs %d\n", cAVIdx, avContext->nb_programs);
