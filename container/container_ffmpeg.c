@@ -25,6 +25,7 @@
 /* ***************************** */
 /* Includes                      */
 /* ***************************** */
+#include "config.h"
 #include "debug.h"
 
 #include <stdio.h>
@@ -117,6 +118,16 @@ static int32_t restart_audio_resampling = 0;
 
 static int64_t g_seek_target_seconds = 0;
 static bool g_do_seek_target_seconds = false;
+
+#ifdef HAVE_DREAMNEXTGEN
+/* After a seek audio starts with the first video keyframe: the kernel syncs
+ * the audio to the clock the video sets, audio from before the keyframe stays
+ * late by up to a GOP. Packets before the keyframe, and the count to give up
+ * on streams that mark no keyframes. */
+static bool seekWaitVideoKey = false;
+static int64_t seekVideoKeyPts = INVALID_PTS_VALUE;
+static int32_t seekVideoSkipped = 0;
+#endif
 static void *g_stamp;
 
 /* ***************************** */
@@ -781,6 +792,11 @@ static void FFMPEGThread(Context_t *context)
             currentVideoPts = -1;
             currentAudioPts = -1;
             latestPts = 0;
+#ifdef HAVE_DREAMNEXTGEN
+            seekWaitVideoKey = true;
+            seekVideoKeyPts = INVALID_PTS_VALUE;
+            seekVideoSkipped = 0;
+#endif
 
             // flush streams
             uint32_t i = 0;
@@ -890,6 +906,11 @@ static void FFMPEGThread(Context_t *context)
                 AVCodecContext *codec_context = videoTrack->avCodecCtx;
                 if (codec_context && codec_context->codec_id == AV_CODEC_ID_MPEG4 && NULL != mpeg4p2_context)
                 {
+#ifdef HAVE_DREAMNEXTGEN
+                    /* the converter writes whole frames on its own, audio does not wait */
+                    seekWaitVideoKey = false;
+                    seekVideoKeyPts = INVALID_PTS_VALUE;
+#endif
                     mpeg4p2_write_packet(context, mpeg4p2_context, videoTrack, cAVIdx, &currentVideoPts, &latestPts, &packet);
                     update_max_injected_pts(latestPts);
                 }
@@ -899,6 +920,10 @@ static void FFMPEGThread(Context_t *context)
                 if (get_codecpar(avContextTab[cAVIdx]->streams[packet.stream_index])->codec_id == AV_CODEC_ID_FLV1 &&
                     0 == memcmp(videoTrack->Encoding, "V_MPEG4", 7) )
                 {
+#ifdef HAVE_DREAMNEXTGEN
+                    seekWaitVideoKey = false;
+                    seekVideoKeyPts = INVALID_PTS_VALUE;
+#endif
                     flv2mpeg4_write_packet(context, &flv2mpeg4_context, videoTrack, cAVIdx, &currentVideoPts, &latestPts, &packet);
                     update_max_injected_pts(latestPts);
                 }
@@ -914,6 +939,24 @@ static void FFMPEGThread(Context_t *context)
                         latestPts = currentVideoPts;
                         update_max_injected_pts(latestPts);
                     }
+
+#ifdef HAVE_DREAMNEXTGEN
+                    if (seekWaitVideoKey)
+                    {
+                        if (!(packet.flags & AV_PKT_FLAG_KEY))
+                            seekVideoSkipped++;
+                        if ((packet.flags & AV_PKT_FLAG_KEY) || seekVideoSkipped > 250)
+                        {
+                            seekWaitVideoKey = false;
+                            seekVideoKeyPts = pts;
+                            ffmpeg_printf(10, "first video %s after the seek, pts %"PRId64"\n", seekVideoSkipped > 250 ? "packet" : "keyframe", pts);
+                        }
+                        else
+                        {
+                            skipPacket = true;
+                        }
+                    }
+#endif
 
                     if (context->playback->isTSLiveMode)
                     {
@@ -982,6 +1025,20 @@ static void FFMPEGThread(Context_t *context)
                     latestPts = currentAudioPts;
                     update_max_injected_pts(latestPts);
                 }
+
+#ifdef HAVE_DREAMNEXTGEN
+                if (videoTrack && seekWaitVideoKey)
+                {
+                    skipPacket = 1;
+                }
+                else if (seekVideoKeyPts != INVALID_PTS_VALUE)
+                {
+                    if (pts != INVALID_PTS_VALUE && pts < seekVideoKeyPts)
+                        skipPacket = 1;
+                    else
+                        seekVideoKeyPts = INVALID_PTS_VALUE;
+                }
+#endif
 
                 if (context->playback->isTSLiveMode)
                 {
