@@ -313,6 +313,16 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
     clock_gettime(CLOCK_MONOTONIC, &t0);
     size_t offset = 0;
     for (;;) {
+        /* no writes into a frozen decoder: a write that keeps finding the
+         * buffer full ends in the write timeout of the driver right after
+         * the pause, and the driver drops every frame until a flush */
+        if (__atomic_load_n(&dv_q_paused, __ATOMIC_RELAXED)) {
+            if (__atomic_load_n(&dv_q_stop, __ATOMIC_RELAXED))
+                return -1;
+            usleep(10000);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            continue;
+        }
         int rc = ioctl(fd, VIDEO_SET_FRAME, &fr);
         if (rc >= 0) {
             /* the driver takes what fits and returns the byte count; the
