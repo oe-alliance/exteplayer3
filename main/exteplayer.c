@@ -121,6 +121,28 @@ int32_t GetGraphicWindowHeight()
     return g_windows_height;
 }
 
+/* enigma2 follows the video of players outside its services here, e.g. for
+ * the automatic resolution */
+#define EXTERNAL_VIDEO_SOCKET "/var/run/video.socket"
+
+static void SendExternalVideo(const char *msg)
+{
+    static int fd = -1;
+    struct sockaddr_un addr;
+
+    if (fd < 0)
+    {
+        fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        if (fd < 0)
+            return;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, EXTERNAL_VIDEO_SOCKET, sizeof(addr.sun_path) - 1);
+    /* without enigma2 listening it goes nowhere */
+    (void)sendto(fd, msg, strlen(msg), 0, (struct sockaddr *)&addr, sizeof(addr));
+}
+
 void E2iSendMsg(const char *format, ...)
 {
     va_list args;
@@ -512,8 +534,11 @@ static int HandleTracks(Manager_t *ptrManager, const PlaybackCmd_t playbackSwitc
                 }
                 else // video
                 {
-                    E2iSendMsg("{\"%c_%c\":{\"id\":%d,\"e\":\"%s\",\"n\":\"%s\",\"w\":%d,\"h\":%d,\"f\":%u,\"p\":%d,\"an\":%d,\"ad\":%d}}\n", \
+                    char msg[512];
+                    snprintf(msg, sizeof(msg), "{\"%c_%c\":{\"id\":%d,\"e\":\"%s\",\"n\":\"%s\",\"w\":%d,\"h\":%d,\"f\":%u,\"p\":%d,\"an\":%d,\"ad\":%d}}\n", \
                     argvBuff[0], argvBuff[1], track->Id , track->Encoding, track->Name, track->width, track->height, track->frame_rate, track->progressive, track->aspect_ratio_num, track->aspect_ratio_den);
+                    E2iSendMsg("%s", msg);
+                    SendExternalVideo(msg);
                 }
                 free(track->Encoding);
                 free(track->Name);
