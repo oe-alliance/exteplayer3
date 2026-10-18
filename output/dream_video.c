@@ -98,6 +98,7 @@ struct video_frame {
 #define DEC_FORMAT_MPEG4_3  1
 #define DEC_FORMAT_MPEG4_5  3
 #define DEC_FORMAT_H264     4
+#define DEC_FORMAT_AVS      13
 #define DEC_FORMAT_HEVC     15
 #define DEC_FORMAT_VP9      16
 
@@ -112,6 +113,10 @@ struct video_frame {
 #define DREAM_STREAMTYPE_MPEG4  4
 #define DREAM_STREAMTYPE_HEVC   22
 #define DREAM_STREAMTYPE_VP9    23
+/* meson64 passes a stream type it does not map on as the decoder format;
+ * 7 reaches the AVS decoder with the patched meson64 */
+#define DREAM_STREAMTYPE_AVS    7
+#define DREAM_STREAMTYPE_AVS2   15
 
 static const char VIDEO_DEV[]   = "/dev/dvb/adapter0/video0";
 static const char AMPOLL_DEV[]  = "/dev/amvideo_poll";
@@ -173,6 +178,8 @@ static int dv_streamtype_for(int bcm_streamtype, int *out)
     case STREAMTYPE_MPEG4_Part2: *out = DREAM_STREAMTYPE_MPEG4; return 0;
     case STREAMTYPE_DIVX311:    *out = DREAM_STREAMTYPE_MPEG4; return 0;
     case STREAMTYPE_VB9:        *out = DREAM_STREAMTYPE_VP9; return 0;
+    case STREAMTYPE_AVS:        *out = DREAM_STREAMTYPE_AVS; return 0;
+    case STREAMTYPE_AVS2:       *out = DREAM_STREAMTYPE_AVS2; return 0;
     default: return -1;
     }
 }
@@ -185,6 +192,8 @@ static int dv_decformat_for(int bcm_streamtype, uint32_t *out)
     case STREAMTYPE_MPEG4_Part2: *out = DEC_FORMAT_MPEG4_5; return 0;
     case STREAMTYPE_DIVX311:    *out = DEC_FORMAT_MPEG4_3; return 0;
     case STREAMTYPE_VB9:        *out = DEC_FORMAT_VP9; return 0;
+    case STREAMTYPE_AVS:        *out = DEC_FORMAT_AVS; return 0;
+    case STREAMTYPE_AVS2:       *out = 0; return 0;
     case STREAMTYPE_MPEG2:      *out = 0; return 0;
     case STREAMTYPE_MPEG1:      *out = 0; return 0;
     default: return -1;

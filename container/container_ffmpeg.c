@@ -436,7 +436,7 @@ static char* Codec2Encoding(int32_t codec_id, int32_t media_type, uint8_t *extra
     // case AV_CODEC_ID_H265:
         return "V_HEVC";
 #endif
-    case AV_CODEC_ID_AVS:
+    case AV_CODEC_ID_CAVS:
         return "V_AVS";
     case AV_CODEC_ID_MP2:
         return "A_MPEG/L3";
