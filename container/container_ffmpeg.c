@@ -2525,7 +2525,7 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
                     if(stream->duration == AV_NOPTS_VALUE || 0 == strncmp(avContext->iformat->name, "dash", 4))
                     {
                         ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                        track.duration = (int64_t) avContext->duration / 1000;
+                        track.duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                     }
 
                     if (context->manager->video)
@@ -2580,7 +2580,7 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
                     if(stream->duration == AV_NOPTS_VALUE)
                     {
                         ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                        track.duration = (int64_t) avContext->duration / 1000;
+                        track.duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                     }
 
                     if(!strncmp(encoding, "A_IPCM", 6) || !strncmp(encoding, "A_LPCM", 6))
@@ -2883,7 +2883,7 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
                     if(stream->duration == AV_NOPTS_VALUE)
                     {
                         ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                        track.duration = (int64_t) avContext->duration / 1000;
+                        track.duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                     }
 
                     ffmpeg_printf(1, "subtitle codec %d\n", get_codecpar(stream)->codec_id);
@@ -3224,7 +3224,7 @@ static int32_t container_ffmpeg_get_length(Context_t *context, int64_t *length)
 
     if (current != NULL)
     {
-        if (current->duration == 0)
+        if (current->duration <= 0)
         {
             return cERR_CONTAINER_FFMPEG_ERR;
         }
@@ -3406,7 +3406,7 @@ static int32_t container_ffmpeg_update_duration(Context_t *context)
                         if(stream->duration == AV_NOPTS_VALUE || 0 == strncmp(avContext->iformat->name, "dash", 4))
                         {
                             ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                            track->duration = (int64_t) avContext->duration / 1000;
+                            track->duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                         }
 
                         ffmpeg_printf(10, "New duration: %"PRId64"\n", track->duration);
@@ -3431,7 +3431,7 @@ static int32_t container_ffmpeg_update_duration(Context_t *context)
                         if(stream->duration == AV_NOPTS_VALUE)
                         {
                             ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                            track->duration = (int64_t) avContext->duration / 1000;
+                            track->duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                         }
 
                         ffmpeg_printf(10, "New duration: %"PRId64"\n", track->duration);
@@ -3455,7 +3455,7 @@ static int32_t container_ffmpeg_update_duration(Context_t *context)
                         if(stream->duration == AV_NOPTS_VALUE)
                         {
                             ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                            track->duration = (int64_t) avContext->duration / 1000;
+                            track->duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                         }
 
                         ffmpeg_printf(10, "New duration: %"PRId64"\n", track->duration);
