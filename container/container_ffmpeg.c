@@ -1616,6 +1616,14 @@ int SAM_ReadFunc(void *ptr, uint8_t *buffer, int lSize)
     if (!io->pMoovFile)
     {
         ret = (int)fread( (void *) buffer, (size_t) 1, (size_t) lSize, io->pFile );
+        /* 0 is no EOF for an AVIOContext, it would read again forever */
+        if (ret == 0)
+        {
+            if (feof(io->pFile))
+                return AVERROR_EOF;
+            if (ferror(io->pFile))
+                return AVERROR(errno ? errno : EIO);
+        }
     }
     else
     {
@@ -1642,6 +1650,10 @@ int SAM_ReadFunc(void *ptr, uint8_t *buffer, int lSize)
         }
 
         io->iOffset += ret;
+        if (ret == 0)
+        {
+            return AVERROR_EOF;
+        }
     }
     return ret;
 }
@@ -1653,7 +1665,17 @@ int64_t SAM_SeekFunc(void *ptr, int64_t pos, int whence)
     int64_t ret = -1;
     if (!io->pMoovFile)
     {
-        if( AVSEEK_SIZE != whence )
+        if( AVSEEK_SIZE == whence )
+        {
+            /* without a size FFmpeg takes the file as one of unknown length */
+            off_t curr = ftello(io->pFile);
+            if (fseeko(io->pFile, 0, SEEK_END) == 0)
+            {
+                ret = (int64_t)ftello(io->pFile);
+                fseeko(io->pFile, curr, SEEK_SET);
+            }
+        }
+        else
         {
             ret = (int64_t)fseeko(io->pFile, (off_t)pos, whence);
             if(0 == ret)
@@ -1761,7 +1783,7 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
     {
         AVIOContext *avio_ctx = NULL;
         custom_io_tab[AVIdx] = malloc(sizeof(CustomIOCtx_t));
-        sizeof(custom_io_tab[AVIdx], 0x00, sizeof(CustomIOCtx_t));
+        memset(custom_io_tab[AVIdx], 0x00, sizeof(CustomIOCtx_t));
 
         custom_io_tab[AVIdx]->szFile = filename;
         custom_io_tab[AVIdx]->iFileSize = fileSize;
@@ -3035,6 +3057,16 @@ static int32_t container_ffmpeg_stop(Context_t *context)
                 av_freep(&(avContextTab[i]->pb->buffer));
                 av_freep(&(avContextTab[i]->pb));
                 use_custom_io[i] = 0;
+
+                if (NULL != custom_io_tab[i])
+                {
+                    if (NULL != custom_io_tab[i]->pFile)
+                        fclose(custom_io_tab[i]->pFile);
+                    if (NULL != custom_io_tab[i]->pMoovFile)
+                        fclose(custom_io_tab[i]->pMoovFile);
+                    free(custom_io_tab[i]);
+                    custom_io_tab[i] = NULL;
+                }
             }
             avformat_close_input(&avContextTab[i]);
             avContextTab[i] = NULL;
