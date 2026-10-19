@@ -878,7 +878,12 @@ int main(int argc, char* argv[])
     int commandRetVal = -1;
 
     /* inform client that we can handle additional commands */
+#ifdef HAVE_DREAMNEXTGEN
+    /* winds on keyframes with f<speed> and b<speed> */
+    E2iSendMsg("{\"EPLAYER3_EXTENDED\":{\"version\":%d,\"trick\":1}}\n", 183);
+#else
     E2iSendMsg("{\"EPLAYER3_EXTENDED\":{\"version\":%d}}\n", 183);
+#endif
 
     PlayFiles_t playbackFiles;
     memset(&playbackFiles, 0x00, sizeof(playbackFiles));
