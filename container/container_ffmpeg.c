@@ -2027,6 +2027,9 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
 
     	sprintf( num, "%u000", context->playback->httpTimeout );
         av_dict_set(&avio_opts, "timeout", num, 0); // default is 10s
+        /* the HLS and DASH demuxers pass rw_timeout, not timeout, on to the
+         * connections of their segments and playlists */
+        av_dict_set(&avio_opts, "rw_timeout", num, 0);
         av_dict_set(&avio_opts, "reconnect", "1", 0);
         if (context->playback->isTSLiveMode) // special mode for live TS stream with skip packet
         {
