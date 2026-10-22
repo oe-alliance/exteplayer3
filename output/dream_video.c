@@ -94,6 +94,9 @@ struct video_frame {
 #define VIDEO_SET_DEC_SYSINFO  _IOWR('o', 65, struct dec_sysinfo)
 #define VIDEO_SET_FRAME        _IOWR('o', 64, struct video_frame)
 
+/* video_event.type of a PTS jump the driver waits to be flushed for */
+#define DV_EVENT_DISCONTINUE   64
+
 /* vdec_type_t — packed into dec_sysinfo.format. */
 #define DEC_FORMAT_MPEG4_3  1
 #define DEC_FORMAT_MPEG4_5  3
@@ -150,6 +153,8 @@ static int              dv_q_stop    = 0;
 /* paused: the consumer holds the queued frames, the decoder is frozen */
 static int              dv_q_paused  = 0;
 static uint64_t         dv_flush_vpts = 0;   /* PTS on screen at the last flush */
+/* DivX 3.11: the picture size goes ahead of the first frame after a start or flush */
+static int              dv_divx3_header = 1;
 
 /* sysfs helpers — best-effort, errors ignored. */
 static void dv_sysfs_write(const char *path, const char *value)
@@ -304,6 +309,26 @@ static uint64_t dv_tsync_read(const char *path)
     return pts;
 }
 
+/* Take the pending events of the driver. At a PTS jump it drops every
+ * write until a flush: flush at once, as enigma2 does on the DVB path.
+ * VIDEO_GET_EVENT succeeds without an event and leaves the buffer alone. */
+static void dv_take_events(int fd)
+{
+    int evt[8];
+    int i;
+    for (i = 0; i < 8; i++) {
+        memset(evt, 0, sizeof(evt));
+        if (ioctl(fd, VIDEO_GET_EVENT, evt) < 0 || !evt[0])
+            return;
+        if (evt[0] == DV_EVENT_DISCONTINUE) {
+            DV_DBG("PTS jump, flushing the video buffer");
+            (void)ioctl(fd, VIDEO_CLEAR_BUFFER);
+            dv_divx3_header = 1;
+            __atomic_store_n(&dv_flush_vpts, dv_tsync_read("/sys/class/tsync/pts_video"), __ATOMIC_RELAXED);
+        }
+    }
+}
+
 /* dreamvideosink (runtime strace):
  *   - öffnet video0 mit O_NONBLOCK
  *   - öffnet /dev/amvideo_poll als O_RDWR (hat es offen, polled aber selten)
@@ -320,8 +345,7 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
     fr.is_phys_addr[0] = 0;
 
     /* Drain a pending event so the kernel buffer-free path can fire. */
-    static int dv_event_buf[8];
-    (void)ioctl(fd, VIDEO_GET_EVENT, dv_event_buf);
+    dv_take_events(fd);
 
     struct pollfd pfds[2];
     pfds[0].fd = fd;             pfds[0].events = POLLIN;
@@ -370,7 +394,7 @@ static int dv_submit_frame(int fd, const uint8_t *data, size_t size, int64_t pts
         if (pr > 0) {
             dv_st_eagain_pollin++;
             /* readable but still full: take the event, do not spin */
-            (void)ioctl(fd, VIDEO_GET_EVENT, dv_event_buf);
+            dv_take_events(fd);
             usleep(5000);
         }
         clock_gettime(CLOCK_MONOTONIC, &t);
@@ -765,9 +789,6 @@ static int dv_write_vp9(const uint8_t *data, size_t size)
 }
 
 /* ----- DivX 3.11 ------------------------------------------------------ */
-
-/* the picture size goes ahead of the first frame after a start or flush */
-static int dv_divx3_header = 1;
 
 /* The Amlogic decoder takes each DivX 3.11 frame behind a start code with
  * the signature and the frame length. */
