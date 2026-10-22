@@ -200,6 +200,22 @@ static int dv_decformat_for(int bcm_streamtype, uint32_t *out)
     }
 }
 
+/* The size from an AVS sequence header: profile, level, progressive,
+ * then 14 bits width and 14 bits height. */
+static int dv_avs_size(const uint8_t *data, size_t len, uint32_t *width, uint32_t *height)
+{
+    size_t i;
+    for (i = 0; data && i + 10 <= len; i++) {
+        if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && data[i + 3] == 0xb0) {
+            uint32_t v = (uint32_t)data[i + 6] << 24 | (uint32_t)data[i + 7] << 16 | (uint32_t)data[i + 8] << 8 | data[i + 9];
+            *width  = (v >> 17) & 0x3fff;
+            *height = (v >> 3) & 0x3fff;
+            return *width && *height ? 0 : -1;
+        }
+    }
+    return -1;
+}
+
 /* ----- Queue helpers + consumer thread -------------------------------- */
 
 static int dv_q_is_full_locked(void)  { return ((dv_q_head + 1) % DV_Q_CAP) == dv_q_tail; }
@@ -596,13 +612,21 @@ static int DreamVideoPts(Context_t *context, unsigned long long *pts)
 
 static int dv_lazy_init(Context_t *context, AudioVideoOut_t *out)
 {
-    if (dv_inited || !out->width || !out->height) return 0;
+    if (dv_inited) return 0;
 
+    uint32_t width = out->width, height = out->height;
     char *Encoding = NULL;
     context->manager->video->Command(context, MANAGER_GETENCODING, &Encoding);
     Writer_t *writer = getWriter(Encoding);
     free(Encoding);
     if (!writer) return -1;
+
+    /* the demuxer has no size for AVS+, the stream has */
+    if ((!width || !height) && writer->caps->dvbStreamType == STREAMTYPE_AVS &&
+        dv_avs_size(out->extradata, out->extralen, &width, &height) < 0 &&
+        dv_avs_size(out->data, out->len, &width, &height) < 0)
+        return 0;
+    if (!width || !height) return 0;
 
     uint32_t dec_format = 0;
     int streamtype = 0;
@@ -615,8 +639,8 @@ static int dv_lazy_init(Context_t *context, AudioVideoOut_t *out)
     struct dec_sysinfo si;
     memset(&si, 0, sizeof(si));
     si.format = dec_format;
-    si.width  = out->width;
-    si.height = out->height;
+    si.width  = width;
+    si.height = height;
     /* rate = frame duration in 96000-tick units (out->frameRate is milli-fps). */
     if (out->frameRate > 0) {
         si.rate = (uint32_t)((uint64_t)96000ULL * 1000U / out->frameRate);
@@ -629,7 +653,7 @@ static int dv_lazy_init(Context_t *context, AudioVideoOut_t *out)
     si.param = NULL;
 
     DV_DBG("lazy_init: w=%u h=%u out->frameRate(milli-fps)=%u → si.rate=%u(96k/frame) dv_frame_dur=%llums dec_format=%u streamtype=%d",
-           out->width, out->height, out->frameRate, si.rate,
+           width, height, out->frameRate, si.rate,
            (unsigned long long)(dv_frame_dur_ns/1000000ULL), dec_format, streamtype);
     if (ioctl(dv_fd, VIDEO_SET_DEC_SYSINFO, &si) < 0) {
         DV_DBG("VIDEO_SET_DEC_SYSINFO failed: %s", strerror(errno));
