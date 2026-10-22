@@ -2514,6 +2514,28 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
             ffmpeg_printf(1, "cAVIdx[%d]: DASH video stream %d\n", cAVIdx, bestVideo);
         }
 
+        /* HLS gives every stream of a variant the number of the variant as id,
+         * and the packets go to the tracks by id: make the ids unique */
+        {
+            uint32_t i, j = 0;
+            for (i = 1; i < avContext->nb_streams; i++)
+            {
+                for (j = 0; j < i; j++)
+                {
+                    if (avContext->streams[i]->id == avContext->streams[j]->id)
+                        break;
+                }
+                if (j < i)
+                    break;
+            }
+            if (i < avContext->nb_streams)
+            {
+                ffmpeg_printf(1, "cAVIdx[%d]: stream id %d used twice, ids from the stream index\n", cAVIdx, avContext->streams[i]->id);
+                for (i = 0; i < avContext->nb_streams; i++)
+                    avContext->streams[i]->id = i;
+            }
+        }
+
         int32_t n = 0;
         for (n = 0; n < avContext->nb_streams; n++)
         {
