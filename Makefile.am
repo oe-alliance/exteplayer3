@@ -64,7 +64,7 @@ exteplayer3_SOURCES = \
     external/plugins/src/png.c
 
 if HAVE_DREAMNEXTGEN
-exteplayer3_SOURCES += output/dream_audio.c output/dream_video.c
+exteplayer3_SOURCES += output/dream_video.c
 endif
 
 exteplayer3_LDADD = \

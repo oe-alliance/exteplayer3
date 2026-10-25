@@ -25,6 +25,7 @@
 /* ***************************** */
 /* Includes                      */
 /* ***************************** */
+#include "config.h"
 #include "debug.h"
 
 #include <stdio.h>
@@ -117,6 +118,31 @@ static int32_t restart_audio_resampling = 0;
 
 static int64_t g_seek_target_seconds = 0;
 static bool g_do_seek_target_seconds = false;
+
+#ifdef HAVE_DREAMNEXTGEN
+/* After a seek audio starts with the first video keyframe: the kernel syncs
+ * the audio to the clock the video sets, audio from before the keyframe stays
+ * late by up to a GOP. Packets before the keyframe, and the count to give up
+ * on streams that mark no keyframes. */
+static bool seekWaitVideoKey = false;
+static int64_t seekVideoKeyPts = INVALID_PTS_VALUE;
+static int32_t seekVideoSkipped = 0;
+
+/* Trick play: the decoder plays at its normal pace, it gets keyframes only.
+ * Each one is a seek from the last one by speed times TRICK_STEP_90K, its PTS
+ * are scaled by the speed from the start; backwards they are mirrored and
+ * keep rising. Audio and subtitles are not fed. */
+#define TRICK_STEP_90K 27000
+static int32_t trickSpeed = 0;              /* >1 forwards, <0 backwards, 0 off */
+static bool trickStep = false;              /* the seek to the next keyframe is due */
+static int64_t trickAnchorPts = INVALID_PTS_VALUE;  /* stream PTS at the start */
+static int64_t trickBasePts = INVALID_PTS_VALUE;    /* output PTS at the start */
+static int64_t trickOutPts = INVALID_PTS_VALUE;     /* output PTS of the last keyframe */
+static int64_t trickKeyPts = INVALID_PTS_VALUE;     /* stream PTS of the last keyframe */
+static int64_t trickDueNs = 0;              /* the last keyframe is on screen then */
+static int64_t trickStartNs = 0;
+static int32_t trickMiss = 0;               /* seeks that found no keyframe beyond the last one */
+#endif
 static void *g_stamp;
 
 /* ***************************** */
@@ -394,9 +420,15 @@ static char* Codec2Encoding(int32_t codec_id, int32_t media_type, uint8_t *extra
 #if LIBAVCODEC_VERSION_MAJOR < 53
     case AV_CODEC_ID_XVID:
 #endif
+#ifdef HAVE_DREAMNEXTGEN
+    case AV_CODEC_ID_MSMPEG4V3:
+        return "V_DIVX3";
+#endif
     case AV_CODEC_ID_MSMPEG4V1:
     case AV_CODEC_ID_MSMPEG4V2:
+#ifndef HAVE_DREAMNEXTGEN
     case AV_CODEC_ID_MSMPEG4V3:
+#endif
         return "V_MPEG4"; //"V_DIVX3";
     case AV_CODEC_ID_WMV1:
         *version = 1;
@@ -419,7 +451,7 @@ static char* Codec2Encoding(int32_t codec_id, int32_t media_type, uint8_t *extra
     // case AV_CODEC_ID_H265:
         return "V_HEVC";
 #endif
-    case AV_CODEC_ID_AVS:
+    case AV_CODEC_ID_CAVS:
         return "V_AVS";
     case AV_CODEC_ID_MP2:
         return "A_MPEG/L3";
@@ -768,8 +800,7 @@ static void FFMPEGThread(Context_t *context)
                  * HLS stitched sources (PlutoTV) it fired on every stitcher
                  * segment boundary and starved the audio producer: vpts
                  * stuck for minutes with av_drift = -425000 ms. Leaving
-                 * disabled. dream_audio's da_reset_anchor_locked() stays
-                 * available for when a real seek-completed wiring exists. */
+                 * disabled. */
             }
             else
             {
@@ -782,6 +813,11 @@ static void FFMPEGThread(Context_t *context)
             currentVideoPts = -1;
             currentAudioPts = -1;
             latestPts = 0;
+#ifdef HAVE_DREAMNEXTGEN
+            seekWaitVideoKey = true;
+            seekVideoKeyPts = INVALID_PTS_VALUE;
+            seekVideoSkipped = 0;
+#endif
 
             // flush streams
             uint32_t i = 0;
@@ -806,6 +842,47 @@ static void FFMPEGThread(Context_t *context)
             flv2mpeg4_context_reset(&flv2mpeg4_context);
 #endif
         }
+
+#ifdef HAVE_DREAMNEXTGEN
+        if (trickSpeed && trickStep && avContextTab[0])
+        {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            if ((int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec < trickDueNs)
+            {
+                releaseMutex(__FILE__, __FUNCTION__,__LINE__);
+                usleep(10000);
+                continue;
+            }
+            int64_t key = av_rescale(trickKeyPts, AV_TIME_BASE, 90000);
+            /* a GOP longer than the step lands on the same keyframe: the step
+             * doubles until the next one is in reach */
+            int64_t target = key + av_rescale((int64_t)trickSpeed * TRICK_STEP_90K * (1LL << trickMiss), AV_TIME_BASE, 90000);
+            if (avContextTab[0]->start_time != AV_NOPTS_VALUE)
+            {
+                key += avContextTab[0]->start_time;
+                target += avContextTab[0]->start_time;
+            }
+            /* the next keyframe in the direction, not the last one again */
+            int ret = trickSpeed > 0 ?
+                avformat_seek_file(avContextTab[0], -1, key + 1, target, INT64_MAX, 0) :
+                avformat_seek_file(avContextTab[0], -1, INT64_MIN, target, key - 1, 0);
+            if (ret < 0)
+            {
+                /* the end or the start: the last picture stays */
+                ffmpeg_printf(10, "trick: no keyframe beyond %"PRId64"\n", trickKeyPts);
+                trickDueNs = INT64_MAX;
+                E2iSendMsg("{\"PLAYBACK_TRICK_END\":{\"dir\":%d}}\n", trickSpeed > 0 ? 1 : -1);
+                releaseMutex(__FILE__, __FUNCTION__,__LINE__);
+                continue;
+            }
+            trickStep = false;
+            seekWaitVideoKey = true;
+            seekVideoKeyPts = INVALID_PTS_VALUE;
+            seekVideoSkipped = 0;
+            isWaitingForFinish = 0;
+        }
+#endif
 
         int ffmpegStatus = 0;
         if(!isWaitingForFinish)
@@ -835,6 +912,13 @@ static void FFMPEGThread(Context_t *context)
             {
                 cAVIdx = 0;
             }
+#ifdef HAVE_DREAMNEXTGEN
+            /* the keyframes come from the video context */
+            if (trickSpeed)
+            {
+                cAVIdx = 0;
+            }
+#endif
         }
 
         if (bufferSize > 0)
@@ -885,12 +969,26 @@ static void FFMPEGThread(Context_t *context)
 
             ffmpeg_printf(200, "packet.size %d - index %d\n", packet.size, pid);
 
+#ifdef HAVE_DREAMNEXTGEN
+            if (trickSpeed && !(videoTrack && (videoTrack->AVIdx == cAVIdx) && (videoTrack->Id == pid)))
+            {
+                wrapped_packet_unref(&packet);
+                releaseMutex(__FILE__, __FUNCTION__,__LINE__);
+                continue;
+            }
+#endif
+
             if (videoTrack && (videoTrack->AVIdx == cAVIdx) && (videoTrack->Id == pid))
             {
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(56, 34, 100)
                 AVCodecContext *codec_context = videoTrack->avCodecCtx;
                 if (codec_context && codec_context->codec_id == AV_CODEC_ID_MPEG4 && NULL != mpeg4p2_context)
                 {
+#ifdef HAVE_DREAMNEXTGEN
+                    /* the converter writes whole frames on its own, audio does not wait */
+                    seekWaitVideoKey = false;
+                    seekVideoKeyPts = INVALID_PTS_VALUE;
+#endif
                     mpeg4p2_write_packet(context, mpeg4p2_context, videoTrack, cAVIdx, &currentVideoPts, &latestPts, &packet);
                     update_max_injected_pts(latestPts);
                 }
@@ -900,6 +998,10 @@ static void FFMPEGThread(Context_t *context)
                 if (get_codecpar(avContextTab[cAVIdx]->streams[packet.stream_index])->codec_id == AV_CODEC_ID_FLV1 &&
                     0 == memcmp(videoTrack->Encoding, "V_MPEG4", 7) )
                 {
+#ifdef HAVE_DREAMNEXTGEN
+                    seekWaitVideoKey = false;
+                    seekVideoKeyPts = INVALID_PTS_VALUE;
+#endif
                     flv2mpeg4_write_packet(context, &flv2mpeg4_context, videoTrack, cAVIdx, &currentVideoPts, &latestPts, &packet);
                     update_max_injected_pts(latestPts);
                 }
@@ -915,6 +1017,24 @@ static void FFMPEGThread(Context_t *context)
                         latestPts = currentVideoPts;
                         update_max_injected_pts(latestPts);
                     }
+
+#ifdef HAVE_DREAMNEXTGEN
+                    if (seekWaitVideoKey)
+                    {
+                        if (!(packet.flags & AV_PKT_FLAG_KEY))
+                            seekVideoSkipped++;
+                        if ((packet.flags & AV_PKT_FLAG_KEY) || seekVideoSkipped > 250)
+                        {
+                            seekWaitVideoKey = false;
+                            seekVideoKeyPts = pts;
+                            ffmpeg_printf(10, "first video %s after the seek, pts %"PRId64"\n", seekVideoSkipped > 250 ? "packet" : "keyframe", pts);
+                        }
+                        else
+                        {
+                            skipPacket = true;
+                        }
+                    }
+#endif
 
                     if (context->playback->isTSLiveMode)
                     {
@@ -947,6 +1067,44 @@ static void FFMPEGThread(Context_t *context)
                     }
 
                     ffmpeg_printf(200, "VideoTrack index = %d %"PRId64"\n",pid, currentVideoPts);
+
+#ifdef HAVE_DREAMNEXTGEN
+                    if (trickSpeed && pts != INVALID_PTS_VALUE &&
+                        (trickSpeed > 0 ? pts <= trickKeyPts : pts >= trickKeyPts) && trickKeyPts != trickAnchorPts)
+                    {
+                        /* not beyond the last keyframe: the next seek goes further,
+                         * at the start or the end the last picture stays */
+                        trickStep = true;
+                        if (++trickMiss > 8)
+                        {
+                            ffmpeg_printf(10, "trick: no keyframe beyond %"PRId64"\n", trickKeyPts);
+                            trickDueNs = INT64_MAX;
+                            E2iSendMsg("{\"PLAYBACK_TRICK_END\":{\"dir\":%d}}\n", trickSpeed > 0 ? 1 : -1);
+                        }
+                        wrapped_packet_unref(&packet);
+                        releaseMutex(__FILE__, __FUNCTION__,__LINE__);
+                        continue;
+                    }
+                    if (trickSpeed)
+                    {
+                        trickMiss = 0;
+                        /* the distance in the stream, scaled by the speed */
+                        int64_t dist = (pts == INVALID_PTS_VALUE) ? 0 : (pts - trickAnchorPts) * (trickSpeed > 0 ? 1 : -1);
+                        if (dist < 0)
+                        {
+                            dist = 0;
+                        }
+                        dist /= abs(trickSpeed);
+                        if (pts != INVALID_PTS_VALUE)
+                        {
+                            trickKeyPts = pts;
+                        }
+                        trickOutPts = pts = dts = (trickBasePts + dist) & 0x1FFFFFFFFLL;
+                        trickDueNs = trickStartNs + av_rescale(dist, 1000000000LL, 90000);
+                        trickStep = true;
+                        ffmpeg_printf(10, "trick: keyframe %"PRId64" as %"PRId64"\n", trickKeyPts, pts);
+                    }
+#endif
 
                     avOut.data       = packet.data;
                     avOut.len        = packet.size;
@@ -983,6 +1141,20 @@ static void FFMPEGThread(Context_t *context)
                     latestPts = currentAudioPts;
                     update_max_injected_pts(latestPts);
                 }
+
+#ifdef HAVE_DREAMNEXTGEN
+                if (videoTrack && seekWaitVideoKey)
+                {
+                    skipPacket = 1;
+                }
+                else if (seekVideoKeyPts != INVALID_PTS_VALUE)
+                {
+                    if (pts != INVALID_PTS_VALUE && pts < seekVideoKeyPts)
+                        skipPacket = 1;
+                    else
+                        seekVideoKeyPts = INVALID_PTS_VALUE;
+                }
+#endif
 
                 if (context->playback->isTSLiveMode)
                 {
@@ -1058,9 +1230,10 @@ static void FFMPEGThread(Context_t *context)
                 {
                     AVCodecContext *c = audioTrack->avCodecCtx;
 
+                    /* cleared once a frame is written: the first packet after
+                     * a seek may give no frame */
                     if (restart_audio_resampling)
                     {
-                        restart_audio_resampling = 0;
                         if (swr)
                         {
                             swr_free(&swr);
@@ -1302,6 +1475,7 @@ static void FFMPEGThread(Context_t *context)
 #endif
                         pcmExtradata.bits_per_coded_sample = 16;
                         pcmExtradata.sample_rate           = out_sample_rate;
+                        pcmExtradata.bResampling           = restart_audio_resampling;
                         // The data described by the sample format is always in native-endian order
 #ifdef WORDS_BIGENDIAN
                         pcmExtradata.codec_id       = AV_CODEC_ID_PCM_S16BE;
@@ -1326,6 +1500,10 @@ static void FFMPEGThread(Context_t *context)
                         if (!context->playback->BackWard && Write(context->output->audio->Write, context, &avOut, pts) < 0)
                         {
                             ffmpeg_err("writing data to audio device failed\n");
+                        }
+                        else
+                        {
+                            restart_audio_resampling = 0;
                         }
                         av_freep(&output[0]);
                     }
@@ -1554,6 +1732,14 @@ int SAM_ReadFunc(void *ptr, uint8_t *buffer, int lSize)
     if (!io->pMoovFile)
     {
         ret = (int)fread( (void *) buffer, (size_t) 1, (size_t) lSize, io->pFile );
+        /* 0 is no EOF for an AVIOContext, it would read again forever */
+        if (ret == 0)
+        {
+            if (feof(io->pFile))
+                return AVERROR_EOF;
+            if (ferror(io->pFile))
+                return AVERROR(errno ? errno : EIO);
+        }
     }
     else
     {
@@ -1580,6 +1766,10 @@ int SAM_ReadFunc(void *ptr, uint8_t *buffer, int lSize)
         }
 
         io->iOffset += ret;
+        if (ret == 0)
+        {
+            return AVERROR_EOF;
+        }
     }
     return ret;
 }
@@ -1591,7 +1781,17 @@ int64_t SAM_SeekFunc(void *ptr, int64_t pos, int whence)
     int64_t ret = -1;
     if (!io->pMoovFile)
     {
-        if( AVSEEK_SIZE != whence )
+        if( AVSEEK_SIZE == whence )
+        {
+            /* without a size FFmpeg takes the file as one of unknown length */
+            off_t curr = ftello(io->pFile);
+            if (fseeko(io->pFile, 0, SEEK_END) == 0)
+            {
+                ret = (int64_t)ftello(io->pFile);
+                fseeko(io->pFile, curr, SEEK_SET);
+            }
+        }
+        else
         {
             ret = (int64_t)fseeko(io->pFile, (off_t)pos, whence);
             if(0 == ret)
@@ -1699,7 +1899,7 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
     {
         AVIOContext *avio_ctx = NULL;
         custom_io_tab[AVIdx] = malloc(sizeof(CustomIOCtx_t));
-        sizeof(custom_io_tab[AVIdx], 0x00, sizeof(CustomIOCtx_t));
+        memset(custom_io_tab[AVIdx], 0x00, sizeof(CustomIOCtx_t));
 
         custom_io_tab[AVIdx]->szFile = filename;
         custom_io_tab[AVIdx]->iFileSize = fileSize;
@@ -1943,6 +2143,9 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
 
     	sprintf( num, "%u000", context->playback->httpTimeout );
         av_dict_set(&avio_opts, "timeout", num, 0); // default is 10s
+        /* the HLS and DASH demuxers pass rw_timeout, not timeout, on to the
+         * connections of their segments and playlists */
+        av_dict_set(&avio_opts, "rw_timeout", num, 0);
         av_dict_set(&avio_opts, "reconnect", "1", 0);
         if (context->playback->isTSLiveMode) // special mode for live TS stream with skip packet
         {
@@ -1960,6 +2163,10 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
             av_dict_set(&avio_opts, "max_reload",             "10", 0);
             av_dict_set(&avio_opts, "http_persistent",         "1", 0);
             av_dict_set(&avio_opts, "http_multiple",           "1", 0);
+            /* segments behind tracking redirects carry no file extension
+             * (FAST channels); the content decides, as in GStreamer */
+            av_dict_set(&avio_opts, "allowed_segment_extensions", "ALL", 0);
+            av_dict_set(&avio_opts, "extension_picky",          "0", 0);
         }
 
         if( strncmp(filename, "http://127.0.0.1", 16) == 0 )
@@ -2205,7 +2412,44 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
 
         ffmpeg_printf(1, "cAVIdx[%d]: number of streams: %d\n", cAVIdx, avContext->nb_streams);
 
-        if (avContext->nb_programs > 0)
+#ifdef HAVE_DREAMNEXTGEN
+        /* HLS lists the variants as programs, the lowest often first: take
+         * the one with the best video, then the highest bitrate */
+        if (avContext->nb_programs > 1 && g_sel_program_id <= 0 && 0 == strcmp(avContext->iformat->name, "hls"))
+        {
+            int64_t bestScore = -1;
+            int64_t bestRate = -1;
+            uint32_t n;
+            for (n = 0; n < avContext->nb_programs; n++)
+            {
+                AVProgram *p = avContext->programs[n];
+                AVDictionaryEntry *e = av_dict_get(p->metadata, "variant_bitrate", NULL, 0);
+                int64_t rate = e ? strtoll(e->value, NULL, 10) : 0;
+                uint32_t m;
+                for (m = 0; m < p->nb_stream_indexes; m++)
+                {
+                    AVStream *s = avContext->streams[p->stream_index[m]];
+                    AVCodecParameters *par = get_codecpar(s);
+                    AVRational fps = get_frame_rate(s);
+                    int64_t score;
+
+                    if (par->codec_type != AVMEDIA_TYPE_VIDEO || par->width <= 0)
+                        continue;
+                    score = (int64_t)par->width * par->height * (fps.den ? 1000 * fps.num / fps.den : 25000);
+                    if (score > bestScore || (score == bestScore && rate > bestRate))
+                    {
+                        bestScore = score;
+                        bestRate = rate;
+                        stream_index = p->stream_index;
+                        nb_stream_indexes = p->nb_stream_indexes;
+                    }
+                    break;
+                }
+            }
+            ffmpeg_printf(1, "cAVIdx[%d]: HLS variant with %lld bit/s\n", cAVIdx, (long long)bestRate);
+        }
+#endif
+        if (avContext->nb_programs > 0 && (0 == nb_stream_indexes || stream_index == NULL))
         {
             uint32_t n = 0;
             ffmpeg_printf(1, "cAVIdx[%d]: stream with multi programs: num of programs %d\n", cAVIdx, avContext->nb_programs);
@@ -2243,6 +2487,55 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
             }
         }
 
+        /* DASH lists every video representation as a stream and only the
+         * first video track plays: take the best one, as the HLS variants */
+        int32_t bestVideo = -1;
+        if (0 == strncmp(avContext->iformat->name, "dash", 4) && !av_dict_get(g_avio_opts, "video_rep_index", NULL, 0))
+        {
+            int64_t bestScore = -1;
+            int64_t bestRate = -1;
+            uint32_t i;
+            for (i = 0; i < avContext->nb_streams; i++)
+            {
+                AVCodecParameters *par = get_codecpar(avContext->streams[i]);
+                AVRational rate = get_frame_rate(avContext->streams[i]);
+                int64_t score;
+
+                if (par->codec_type != AVMEDIA_TYPE_VIDEO)
+                    continue;
+                score = (int64_t)par->width * par->height * (rate.den ? 1000 * rate.num / rate.den : 25000);
+                if (score > bestScore || (score == bestScore && par->bit_rate > bestRate))
+                {
+                    bestScore = score;
+                    bestRate = par->bit_rate;
+                    bestVideo = i;
+                }
+            }
+            ffmpeg_printf(1, "cAVIdx[%d]: DASH video stream %d\n", cAVIdx, bestVideo);
+        }
+
+        /* HLS gives every stream of a variant the number of the variant as id,
+         * and the packets go to the tracks by id: make the ids unique */
+        {
+            uint32_t i, j = 0;
+            for (i = 1; i < avContext->nb_streams; i++)
+            {
+                for (j = 0; j < i; j++)
+                {
+                    if (avContext->streams[i]->id == avContext->streams[j]->id)
+                        break;
+                }
+                if (j < i)
+                    break;
+            }
+            if (i < avContext->nb_streams)
+            {
+                ffmpeg_printf(1, "cAVIdx[%d]: stream id %d used twice, ids from the stream index\n", cAVIdx, avContext->streams[i]->id);
+                for (i = 0; i < avContext->nb_streams; i++)
+                    avContext->streams[i]->id = i;
+            }
+        }
+
         int32_t n = 0;
         for (n = 0; n < avContext->nb_streams; n++)
         {
@@ -2250,6 +2543,12 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
             AVStream *stream = avContext->streams[n];
             int32_t version = 0;
             char *encoding = NULL;
+
+            if (bestVideo >= 0 && n != bestVideo && get_codecpar(stream)->codec_type == AVMEDIA_TYPE_VIDEO)
+            {
+                stream->discard = AVDISCARD_ALL;
+                continue;
+            }
 
             if (nb_stream_indexes > 0 && stream_index != NULL)
             {
@@ -2367,7 +2666,7 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
                     if(stream->duration == AV_NOPTS_VALUE || 0 == strncmp(avContext->iformat->name, "dash", 4))
                     {
                         ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                        track.duration = (int64_t) avContext->duration / 1000;
+                        track.duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                     }
 
                     if (context->manager->video)
@@ -2422,7 +2721,7 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
                     if(stream->duration == AV_NOPTS_VALUE)
                     {
                         ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                        track.duration = (int64_t) avContext->duration / 1000;
+                        track.duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                     }
 
                     if(!strncmp(encoding, "A_IPCM", 6) || !strncmp(encoding, "A_LPCM", 6))
@@ -2725,7 +3024,7 @@ int32_t container_ffmpeg_update_tracks(Context_t *context, char *filename, int32
                     if(stream->duration == AV_NOPTS_VALUE)
                     {
                         ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                        track.duration = (int64_t) avContext->duration / 1000;
+                        track.duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                     }
 
                     ffmpeg_printf(1, "subtitle codec %d\n", get_codecpar(stream)->codec_id);
@@ -2899,6 +3198,16 @@ static int32_t container_ffmpeg_stop(Context_t *context)
                 av_freep(&(avContextTab[i]->pb->buffer));
                 av_freep(&(avContextTab[i]->pb));
                 use_custom_io[i] = 0;
+
+                if (NULL != custom_io_tab[i])
+                {
+                    if (NULL != custom_io_tab[i]->pFile)
+                        fclose(custom_io_tab[i]->pFile);
+                    if (NULL != custom_io_tab[i]->pMoovFile)
+                        fclose(custom_io_tab[i]->pMoovFile);
+                    free(custom_io_tab[i]);
+                    custom_io_tab[i] = NULL;
+                }
             }
             avformat_close_input(&avContextTab[i]);
             avContextTab[i] = NULL;
@@ -2946,6 +3255,88 @@ static int32_t container_ffmpeg_seek_bytes(off_t pos)
 
     return cERR_CONTAINER_FFMPEG_NO_ERROR;
 }
+
+#ifdef HAVE_DREAMNEXTGEN
+/* Start, change or end the trick play: *arg is the speed, 0 ends it and
+ * returns the stream PTS of the last keyframe to go on from. */
+static int32_t container_ffmpeg_trick(Context_t *context, int64_t *arg)
+{
+    int32_t speed = (int32_t)*arg;
+    unsigned long long screen = 0;
+    Track_t *videoTrack = NULL;
+    struct timespec ts;
+
+    if (speed)
+    {
+        context->manager->video->Command(context, MANAGER_GET_TRACK, &videoTrack);
+        /* the MPEG-4 part 2 and FLV converters write frames of their own */
+        if (!videoTrack || videoTrack->AVIdx != 0 || !videoTrack->stream ||
+            get_codecpar(videoTrack->stream)->codec_id == AV_CODEC_ID_MPEG4 ||
+            get_codecpar(videoTrack->stream)->codec_id == AV_CODEC_ID_FLV1)
+        {
+            ffmpeg_err("trick: no video track it can wind\n");
+            return cERR_CONTAINER_FFMPEG_ERR;
+        }
+        if (!trickSpeed && (context->output->Command(context, OUTPUT_PTS, &screen) < 0 || !screen))
+        {
+            ffmpeg_err("trick: no picture on screen yet\n");
+            return cERR_CONTAINER_FFMPEG_ERR;
+        }
+    }
+
+    getMutex_wr(__FILE__, __FUNCTION__,__LINE__);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (speed)
+    {
+        if (trickSpeed)
+        {
+            /* a new speed goes on from the last keyframe */
+            trickAnchorPts = trickKeyPts;
+            trickBasePts = trickOutPts;
+        }
+        else
+        {
+            trickAnchorPts = trickKeyPts = trickBasePts = trickOutPts = (int64_t)(screen & 0x1FFFFFFFFULL);
+            /* what is queued plays in real time */
+            context->output->Command(context, OUTPUT_CLEAR, NULL);
+        }
+        trickSpeed = speed;
+        trickStartNs = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+        trickDueNs = 0;
+        trickMiss = 0;
+        trickStep = true;
+    }
+    else
+    {
+        *arg = trickSpeed ? trickKeyPts : INVALID_PTS_VALUE;
+        trickSpeed = 0;
+        trickStep = false;
+    }
+    releaseMutex(__FILE__, __FUNCTION__,__LINE__);
+    ffmpeg_printf(10, "trick: speed %d from %"PRId64"\n", speed, trickAnchorPts);
+    return cERR_CONTAINER_FFMPEG_NO_ERROR;
+}
+
+/* The stream PTS of a picture of the trick play. */
+static int32_t container_ffmpeg_trick_pts(int64_t *pts)
+{
+    int32_t speed = trickSpeed;
+
+    if (!speed)
+    {
+        return cERR_CONTAINER_FFMPEG_ERR;
+    }
+    int64_t dist = (*pts - trickBasePts) & 0x1FFFFFFFFLL;
+    /* a picture from before the last change of the speed */
+    if (dist >= (1LL << 32))
+    {
+        dist = 0;
+    }
+    int64_t pts_stream = trickAnchorPts + dist * speed;
+    *pts = pts_stream < 0 ? 0 : pts_stream & 0x1FFFFFFFFLL;
+    return cERR_CONTAINER_FFMPEG_NO_ERROR;
+}
+#endif
 
 static int32_t container_ffmpeg_seek(Context_t *context, int64_t sec, uint8_t absolute)
 {
@@ -3056,7 +3447,7 @@ static int32_t container_ffmpeg_get_length(Context_t *context, int64_t *length)
 
     if (current != NULL)
     {
-        if (current->duration == 0)
+        if (current->duration <= 0)
         {
             return cERR_CONTAINER_FFMPEG_ERR;
         }
@@ -3238,7 +3629,7 @@ static int32_t container_ffmpeg_update_duration(Context_t *context)
                         if(stream->duration == AV_NOPTS_VALUE || 0 == strncmp(avContext->iformat->name, "dash", 4))
                         {
                             ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                            track->duration = (int64_t) avContext->duration / 1000;
+                            track->duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                         }
 
                         ffmpeg_printf(10, "New duration: %"PRId64"\n", track->duration);
@@ -3263,7 +3654,7 @@ static int32_t container_ffmpeg_update_duration(Context_t *context)
                         if(stream->duration == AV_NOPTS_VALUE)
                         {
                             ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                            track->duration = (int64_t) avContext->duration / 1000;
+                            track->duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                         }
 
                         ffmpeg_printf(10, "New duration: %"PRId64"\n", track->duration);
@@ -3287,7 +3678,7 @@ static int32_t container_ffmpeg_update_duration(Context_t *context)
                         if(stream->duration == AV_NOPTS_VALUE)
                         {
                             ffmpeg_printf(10, "Stream has no duration so we take the duration from context\n");
-                            track->duration = (int64_t) avContext->duration / 1000;
+                            track->duration = (AV_NOPTS_VALUE == avContext->duration) ? 0 : (int64_t) avContext->duration / 1000;
                         }
 
                         ffmpeg_printf(10, "New duration: %"PRId64"\n", track->duration);
@@ -3398,6 +3789,18 @@ static int32_t Command(void  *_context, ContainerCmd_t command, void *argument)
         *((int32_t*)argument) = size;
         break;
     }
+#ifdef HAVE_DREAMNEXTGEN
+    case CONTAINER_TRICK:
+    {
+        ret = container_ffmpeg_trick(context, (int64_t *)argument);
+        break;
+    }
+    case CONTAINER_TRICK_PTS:
+    {
+        ret = container_ffmpeg_trick_pts((int64_t *)argument);
+        break;
+    }
+#endif
     case CONTAINER_UPDATE_DURATION:
     {
         ret = container_ffmpeg_update_duration(context);

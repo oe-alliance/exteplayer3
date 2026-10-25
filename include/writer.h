@@ -83,6 +83,7 @@ extern Writer_t WriterFramebuffer;
 extern Writer_t WriterPipe;
 extern Writer_t WriterVideoRV30;
 extern Writer_t WriterVideoRV40;
+extern Writer_t WriterVideoAVS;
 extern Writer_t WriterVideoAVS2;
 
 Writer_t* getWriter(char* encoding);
