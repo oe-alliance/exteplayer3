@@ -1956,7 +1956,6 @@ int32_t container_ffmpeg_init_av_context(Context_t *context, char *filename, uin
         if (strstr(filename, ".m3u"))
         {
             av_dict_set(&avio_opts, "recv_buffer_size",  "4194304", 0);
-            av_dict_set(&avio_opts, "multiple_requests",       "1", 0);
             av_dict_set(&avio_opts, "live_start_index",       "-3", 0);
             av_dict_set(&avio_opts, "max_reload",             "10", 0);
             av_dict_set(&avio_opts, "http_persistent",         "1", 0);
